@@ -1,0 +1,1054 @@
+"""
+================================================================================
+ DATASET  ->  TELEGRAM  (private channel)   ·   BATCHED JSON  ·   FAST
+================================================================================
+ Ek message me JITNE RECORDS FIT HOTE HAIN utne bhejta hai (valid JSON array),
+ isliye messages ki ginti 10-30x kam -> speed 10-30x zyada.
+
+ Env (.env):
+   HF_DATASET=username/dataset        (required)
+   HF_TOKEN=                          (private dataset)
+   HF_CONFIG=default  HF_SPLIT=train
+   BOT_TOKEN=123456:ABC...
+   CHANNEL_ID=-1001234567890123
+   ADMIN_ID=123456789
+   API_ID=1234567  API_HASH=abcd...   (MTProto -> 20 msg/min ka limit nahi)
+   MODE=auto                          auto|user|bot
+   BATCH_MODE=auto                    auto = message ko bhar bhar ke bhejo
+                                      count = BATCH_SIZE records exactly
+   BATCH_SIZE=20                      max records per message
+   MSG_CHARS=3800                     message size budget (Telegram limit 4096)
+   CONCURRENCY=8                      8 messages in parallel (order safe)
+   DELAY=0                            per message gap (0 = full speed)
+   PROGRESS_EVERY=10                  admin progress interval (seconds)
+   STATE_SAVE_EVERY=10                state save interval (batches)
+   START_OFFSET=0  END_OFFSET=0  STATE_FILE=state.json
+================================================================================
+"""
+
+import os
+import sys
+import json
+import time
+import signal
+import asyncio
+import logging
+import collections
+import html as _html
+from datetime import datetime, timezone
+
+import httpx
+
+# --------------------------------------------------------------------- logging
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)-7s | %(message)s",
+    datefmt="%H:%M:%S",
+)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("telethon").setLevel(logging.WARNING)
+log = logging.getLogger("exporter")
+
+
+# ---------------------------------------------------------------- .env loader
+
+def load_dotenv(path: str = ".env") -> None:
+    try:
+        here = os.path.dirname(os.path.abspath(__file__))
+        target = next((p for p in (path, os.path.join(here, path)) if os.path.isfile(p)), None)
+        if not target:
+            return
+        with open(target, "r", encoding="utf-8-sig") as handle:
+            for raw in handle:
+                line = raw.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if line.lower().startswith("export "):
+                    line = line[7:].strip()
+                if "=" not in line:
+                    continue
+                name, value = line.split("=", 1)
+                name, value = name.strip(), value.strip()
+                if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+                    value = value[1:-1]
+                if name and name not in os.environ:
+                    os.environ[name] = value
+    except Exception:
+        log.warning(".env read failed (ignored)")
+
+
+load_dotenv()
+
+
+def env(name: str, default: str = "") -> str:
+    value = os.getenv(name)
+    return default if value is None else str(value).strip()
+
+
+def env_int(name: str, default: int) -> int:
+    try:
+        return int(env(name, str(default)) or default)
+    except ValueError:
+        return default
+
+
+def env_float(name: str, default: float) -> float:
+    try:
+        return float(env(name, str(default)) or default)
+    except ValueError:
+        return default
+
+
+# --------------------------------------------------------------------- config
+
+HF_DATASET = env("HF_DATASET")
+HF_TOKEN = env("HF_TOKEN")
+HF_CONFIG = env("HF_CONFIG", "default") or "default"
+HF_SPLIT = env("HF_SPLIT", "train") or "train"
+HF_API = "https://datasets-server.huggingface.co"
+HF_MAX = 100                       # HF /rows ka max per request
+
+BOT_TOKEN = env("BOT_TOKEN") or env("TG_BOT_TOKEN")
+CHANNEL_ID = env("CHANNEL_ID") or env("TG_CHANNEL") or env("TG_BOT_CHAT")
+ADMIN_ID = env("ADMIN_ID") or env("TG_ADMIN_ID") or env("BOT_CHAT_ID")
+
+API_ID = env_int("API_ID", env_int("TG_API_ID", 0))
+API_HASH = env("API_HASH") or env("TG_API_HASH")
+
+MODE_RAW = (env("MODE", "auto") or "auto").lower()
+MODE = "bot" if MODE_RAW == "auto" else MODE_RAW
+
+BATCH_MODE = (env("BATCH_MODE", "auto") or "auto").lower()
+BATCH_SIZE = max(1, min(100, env_int("BATCH_SIZE", 20)))
+MSG_CHARS = max(600, min(4000, env_int("MSG_CHARS", 3800)))
+# itna bada record message me trim karke nahi bhejte -> .json file (data safe)
+MAX_TRIM = max(4, env_int("MAX_TRIM_KB", 8)) * 1024
+
+PROGRESS_EVERY = env_float("PROGRESS_EVERY", 10.0)
+STATE_SAVE_EVERY = env_int("STATE_SAVE_EVERY", 10)
+START_OFFSET = env_int("START_OFFSET", 0)
+END_OFFSET = env_int("END_OFFSET", 0)
+STATE_FILE = env("STATE_FILE", "state.json") or "state.json"
+MAX_RETRIES = env_int("MAX_RETRIES", 4)
+
+# --------------------------------------------------------- multi-account pool
+# 5 bots + 5 api_id/hash support:
+#   ACCOUNTS=123:abc:TOKEN1, 456:def:TOKEN2, ...   (api_id:api_hash:bot_token)
+#   ya lists: API_IDS=1,2,3  API_HASHES=a,b,c  BOT_TOKENS=t1,t2,t3
+#   ya single: BOT_TOKEN= + API_ID= + API_HASH=
+
+def _split_list(raw: str) -> list:
+    items = []
+    for part in (raw or "").replace("\n", ",").split(","):
+        part = part.strip().strip("'\"").strip()
+        if part:
+            items.append(part)
+    return items
+
+
+def parse_pool() -> list:
+    """Har account: {api_id, api_hash, bot_token}. Sab valid combos return karta hai."""
+    pool = []
+
+    # (a) ACCOUNTS="api_id:api_hash:token"
+    for entry in _split_list(env("ACCOUNTS")):
+        parts = [p.strip() for p in entry.split(":")]
+        api_id = api_hash = token = ""
+        if len(parts) >= 3:
+            api_id, api_hash, token = parts[0], parts[1], ":".join(parts[2:])
+        elif len(parts) == 2:
+            api_id, api_hash = parts[0], parts[1]
+        elif len(parts) == 1:
+            token = parts[0]
+        try:
+            api_id_int = int(api_id) if api_id else 0
+        except ValueError:
+            api_id_int = 0
+        if api_id_int and api_hash:
+            pool.append({"api_id": api_id_int, "api_hash": api_hash, "bot_token": token or BOT_TOKEN})
+        elif token:
+            pool.append({"api_id": 0, "api_hash": "", "bot_token": token})
+
+    if pool:
+        return pool
+
+    # (b) lists  API_IDS / API_HASHES / BOT_TOKENS (index se zip)
+    ids = _split_list(env("API_IDS"))
+    hashes = _split_list(env("API_HASHES") or env("API_HASH"))
+    tokens = _split_list(env("BOT_TOKENS") or env("BOT_TOKEN"))
+
+    count = max(len(ids), len(hashes), len(tokens))
+    for i in range(count):
+        api_id = 0
+        if i < len(ids):
+            try:
+                api_id = int(ids[i])
+            except ValueError:
+                api_id = 0
+        api_hash = hashes[i] if i < len(hashes) else ""
+        token = tokens[i] if i < len(tokens) else (tokens[0] if tokens else "")
+        if api_id and api_hash:
+            pool.append({"api_id": api_id, "api_hash": api_hash, "bot_token": token})
+        elif token:
+            pool.append({"api_id": 0, "api_hash": "", "bot_token": token})
+
+    return pool
+
+
+POOL = parse_pool()
+
+# MODE=auto -> agar kisi account me api_id/hash hai to MTProto (fast), warna bot
+if MODE_RAW == "auto":
+    MODE = "user" if any(a["api_id"] and a["api_hash"] for a in POOL) else "bot"
+
+# per-account parallel messages (total window = accounts x ye)
+WAIT_FOR_ACCOUNT = env("WAIT_FOR_ACCOUNT", "1") not in ("0", "false", "no")
+# MTProto logins ek saath na ho (FLOOD_WAIT se bachne ke liye) — chhota gap
+LOGIN_STAGGER = env_float("LOGIN_STAGGER", 0.8)
+PER_ACCOUNT = env_int("PER_ACCOUNT_CONCURRENCY", env_int("CONCURRENCY", 4))
+PER_ACCOUNT = max(1, min(16, PER_ACCOUNT))
+
+if MODE == "user":
+    DELAY = env_float("DELAY", 0.0)
+else:
+    DELAY = env_float("DELAY", 3.0)
+
+DELAY = max(0.0, DELAY)
+ACCOUNTS_N = max(1, len(POOL))
+# total in-flight messages = accounts x per-account (max 32)
+CONCURRENCY = max(1, min(32, PER_ACCOUNT * ACCOUNTS_N))
+
+
+
+def as_chat_id(value: str):
+    value = (value or "").strip()
+    if not value:
+        return None
+    if value.lstrip("-").isdigit():
+        return int(value)
+    return value
+
+
+# ---------------------------------------------------------------------- state
+
+DEFAULT_STATE = {
+    "dataset": "", "config": "", "split": "",
+    "offset": 0, "sent": 0, "messages": 0, "total": 0,
+    "finished": False, "started_at": "", "updated_at": "", "last_error": "",
+}
+
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def load_state() -> dict:
+    state = dict(DEFAULT_STATE)
+    try:
+        with open(STATE_FILE, "r", encoding="utf-8") as handle:
+            saved = json.load(handle)
+        if isinstance(saved, dict):
+            state.update(saved)
+        log.info("STATE loaded -> offset=%s sent=%s messages=%s finished=%s",
+                 state["offset"], state["sent"], state["messages"], state["finished"])
+    except FileNotFoundError:
+        log.info("STATE nahi mila -> fresh start (offset %s)", START_OFFSET)
+        state["offset"] = START_OFFSET
+    except Exception as exc:
+        log.warning("STATE read failed (%s) -> fresh start", exc)
+
+    if state.get("dataset") and state["dataset"] != HF_DATASET:
+        log.warning("STATE dusre dataset ka hai -> reset")
+        state = dict(DEFAULT_STATE)
+        state["offset"] = START_OFFSET
+
+    state["dataset"] = HF_DATASET
+    state["config"] = HF_CONFIG
+    state["split"] = HF_SPLIT
+    if not state.get("started_at"):
+        state["started_at"] = now_iso()
+    if START_OFFSET and not state.get("offset"):
+        state["offset"] = START_OFFSET
+    return state
+
+
+def save_state(state: dict) -> None:
+    state["updated_at"] = now_iso()
+    tmp = STATE_FILE + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as handle:
+            json.dump(state, handle, ensure_ascii=False, separators=(",", ":"))
+        os.replace(tmp, STATE_FILE)
+    except Exception as exc:
+        log.error("STATE save failed: %s", exc)
+
+
+# ------------------------------------------------------------------ HF reader
+
+def hf_headers() -> dict:
+    headers = {"User-Agent": "Dataset-TG-Exporter/4.0"}
+    if HF_TOKEN:
+        headers["Authorization"] = f"Bearer {HF_TOKEN}"
+    return headers
+
+
+class HfReader:
+    """100-row chunk + background prefetch (fetch kabhi bhi bottleneck nahi)."""
+
+    def __init__(self, client: httpx.AsyncClient):
+        self.client = client
+        self.total = 0
+        self.chunks: dict = {}
+        self._prefetch: dict = {}
+
+    async def fetch(self, offset: int, length: int) -> dict:
+        last_error = ""
+        for attempt in range(1, MAX_RETRIES + 1):
+            try:
+                response = await self.client.get(
+                    f"{HF_API}/rows",
+                    params={
+                        "dataset": HF_DATASET,
+                        "config": HF_CONFIG,
+                        "split": HF_SPLIT,
+                        "offset": offset,
+                        "length": min(HF_MAX, max(1, length)),
+                    },
+                    timeout=45.0,
+                )
+                if response.status_code == 429:
+                    await asyncio.sleep(min(30, 3 * attempt))
+                    last_error = "HTTP 429"
+                    continue
+                if response.status_code >= 400:
+                    last_error = f"HTTP {response.status_code}"
+                    await asyncio.sleep(min(20, 2 * attempt))
+                    continue
+                data = response.json()
+                if data.get("error"):
+                    last_error = str(data["error"])
+                    await asyncio.sleep(min(20, 2 * attempt))
+                    continue
+                return data
+            except Exception as exc:
+                last_error = str(exc)
+                await asyncio.sleep(min(20, 2 * attempt))
+        raise RuntimeError(f"HF rows fetch failed: {last_error}")
+
+    async def _load_chunk(self, start: int) -> list:
+        if start in self.chunks:
+            return self.chunks[start]
+        data = await self.fetch(start, HF_MAX)
+        self.total = int(data.get("num_rows_total") or self.total or 0)
+        records = []
+        for i, item in enumerate(data.get("rows", []) or []):
+            row = item.get("row") if isinstance(item, dict) else None
+            if not isinstance(row, dict):
+                row = {"value": item}
+            record = clean(row)
+            record["_index"] = item.get("row_idx", start + i) if isinstance(item, dict) else start + i
+            records.append(record)
+        self.chunks[start] = records
+        for key in [k for k in self.chunks if k < start - HF_MAX * 2]:
+            self.chunks.pop(key, None)
+        return records
+
+    def prefetch(self, offset: int) -> None:
+        start = offset - (offset % HF_MAX)
+        nxt = start + HF_MAX
+        if self.total and nxt >= self.total:
+            return
+        if nxt in self.chunks:
+            return
+        task = self._prefetch.get(nxt)
+        if task and not task.done():
+            return
+        self._prefetch[nxt] = asyncio.create_task(self._safe_load(nxt))
+
+    async def _safe_load(self, start: int) -> None:
+        try:
+            await self._load_chunk(start)
+        except Exception as exc:
+            log.debug("prefetch fail (%s) — ignore", exc)
+
+    async def get(self, offset: int):
+        start = offset - (offset % HF_MAX)
+        if start not in self.chunks:
+            await self._load_chunk(start)
+            log.info("HF chunk %s ready (total %s)", start, self.total)
+        records = self.chunks[start]
+        position = offset - start
+        record = records[position] if 0 <= position < len(records) else None
+        self.prefetch(offset)
+        return record, self.total
+
+
+def clean(value):
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, dict):
+        return {str(k): clean(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [clean(v) for v in value]
+    return str(value)
+
+
+# ------------------------------------------------------------------ messages --
+
+def _truncated(record: dict, limit: int) -> bool:
+    """Sach me kuch trim hua? (nahi hua to 'trimmed' label galat hoga)"""
+    def walked(value):
+        if isinstance(value, str):
+            return len(value) > limit
+        if isinstance(value, dict):
+            return any(walked(v) for v in value.values())
+        if isinstance(value, list):
+            return any(walked(v) for v in value)
+        return False
+    return walked(record)
+
+
+def _shrink(record: dict, limit: int = 1200) -> dict:
+    def cut(value):
+        if isinstance(value, str):
+            return value if len(value) <= limit else value[:limit] + f"…[+{len(value) - limit} chars]"
+        if isinstance(value, dict):
+            return {k: cut(v) for k, v in value.items()}
+        if isinstance(value, list):
+            return [cut(v) for v in value]
+        return value
+    return {k: cut(v) for k, v in record.items()}
+
+
+def html_escape(text: str) -> str:
+    return _html.escape(str(text), quote=False)
+
+
+def _pretty_block(record: dict, step: int = 2) -> str:
+    """Record ka pretty JSON (indent 2), array ke andar 2 space indent ke saath."""
+    dumped = json.dumps(record, ensure_ascii=False, indent=step)
+    return "\n".join("  " + line for line in dumped.split("\n"))
+
+
+def _header(start: int, count: int, total: int) -> str:
+    if count <= 1:
+        return f"#{start + 1}/{total or '?'}"
+    last = start + count                      # 1-based: 0..5 -> "#1–6"
+    return f"#{start + 1}–{last}/{total or '?'}"
+
+
+PRE_OPEN = '<pre><code class="language-json">'
+PRE_CLOSE = "</code></pre>"
+
+
+def _render(header: str, body: str) -> str:
+    """Telegram HTML: header + code block (pretty JSON andar)."""
+    return (
+        html_escape(header)
+        + "\n"
+        + PRE_OPEN
+        + html_escape(body)
+        + PRE_CLOSE
+    )
+
+
+def build_batch(items: list, total: int):
+    """
+    items: [(offset, record), ...]
+    Ek message me JITNE RECORDS PRETTY-PRINT (indent 2) me fit hote hain utne.
+    Returns (text, caption, file_or_None, count).
+    """
+    start = items[0][0]
+    # header ki worst-case length reserve (count ke digits badh sakte hain)
+    reserve = len(html_escape(_header(start, BATCH_SIZE, total))) + 2 \
+        + len(PRE_OPEN) + len(PRE_CLOSE)
+    budget = MSG_CHARS - reserve
+
+    blocks = [_pretty_block(record) for _, record in items[:BATCH_SIZE]]
+
+    # ---- array / object me kitne fit honge (pretty, indent 2) ----
+    chosen = 0
+    used = len(html_escape("[\n\n]"))          # brackets
+    for block in blocks:
+        add = len(html_escape(block)) + (2 if chosen else 0)   # ",\n"
+        if used + add > budget:
+            break
+        used += add
+        chosen += 1
+
+    if chosen >= 2:
+        body = "[\n" + ",\n".join(blocks[:chosen]) + "\n]"
+        header = _header(start, chosen, total)
+        text = _render(header, body)
+        if len(text) <= MSG_CHARS:
+            return text, header, None, chosen
+
+    # ---- ek hi record (object form, pretty) ----
+    if chosen >= 1:
+        offset, record = items[0]
+        body = json.dumps(record, ensure_ascii=False, indent=2)
+        header = _header(offset, 1, total)
+        text = _render(header, body)
+        if len(text) <= MSG_CHARS:
+            return text, header, None, 1
+
+    # ---- ek single record jo message me fit nahi: sirf chhoti trim (<=100 chars) ----
+    # zyada trim = data barbaad, isliye limit ke hisaab se chhota cut, warna file
+    offset, record = items[0]
+    if len(_pretty_block(record)) > MAX_TRIM:
+        limit = 400
+        body = json.dumps(_shrink(record, limit), ensure_ascii=False, indent=2)
+        header = _header(offset, 1, total)
+        text = _render(header, body)
+        if len(text) <= MSG_CHARS and not _truncated(record, limit):
+            return text, header + " (trimmed)", None, 1
+
+    # ---- last resort: poora pretty JSON file ke roop me ----
+    payload = json.dumps(record, ensure_ascii=False, indent=2).encode("utf-8")
+    header = _header(offset, 1, total)
+    return (
+        f"{header} — bada record, .json file me bheja",
+        f"{header} (bada record -> .json file)",
+        (f"record_{offset}.json", payload),
+        1,
+    )
+
+
+class FloodWait(Exception):
+    def __init__(self, seconds: int, detail=""):
+        super().__init__(f"FloodWait {seconds}s")
+        self.seconds = max(1, int(seconds))
+        self.detail = detail
+
+
+class SendGate:
+    """Per-account flood control: ek account flood-wait me -> sirf wahi rukta hai."""
+
+    def __init__(self, label: str = ""):
+        self.label = label
+        self.pause_until = 0.0
+        self.lock = asyncio.Lock()
+        self.sent = 0
+        self.errors = 0
+
+    async def wait(self):
+        while True:
+            left = self.pause_until - time.monotonic()
+            if left <= 0:
+                return
+            await asyncio.sleep(min(left, 5.0))
+
+    async def pause(self, seconds: int):
+        async with self.lock:
+            target = time.monotonic() + min(seconds, 900) + 1
+            self.pause_until = max(self.pause_until, target)
+        log.warning("⏳ [%s] flood-wait %ss -> ye account %ss ruk gaya",
+                    self.label, seconds, seconds)
+
+
+class AccountPool:
+    """
+    STRICT ALTERNATE: message 1 -> acc1, 2 -> acc2, 3 -> acc3, ... 6 -> acc6,
+    7 -> acc1 (phir se). Har record ka account pehle se tay hota hai (deterministic),
+    isliye koi record miss/mismatch nahi hota.
+
+    Agar kisi account ka flood-wait chal raha ho:
+      • WAIT_FOR_ACCOUNT=1 (default) -> usi ka number ban raha hai to uska wait hoga
+        (order aur alternation dono intact, dhakka-mukki nahi)
+      • WAIT_FOR_ACCOUNT=0 -> agla free account (speed zyada, pattern thoda tootega)
+    """
+
+    def __init__(self, accounts: list, wait_for_account: bool = True):
+        self.accounts = accounts                     # [(label, sender)]
+        self.gates = {label: SendGate(label) for label, _ in accounts}
+        self.senders = {label: sender for label, sender in accounts}
+        self.wait_for_account = wait_for_account
+        self._assignment = 0                         # record-message number (0-based)
+        self._admin_i = 0                            # admin/progress ke liye alag
+
+    def __len__(self):
+        return len(self.accounts)
+
+    @property
+    def labels(self) -> list:
+        return [label for label, _ in self.accounts]
+
+    def assign(self):
+        """Strict number-wise account (no await -> order safe)."""
+        idx = self._assignment % len(self.accounts)
+        self._assignment += 1
+        label, sender = self.accounts[idx]
+        return label, sender, self.gates[label], idx
+
+    def assign_admin(self):
+        """Admin/progress messages — record pattern ko disturb nahi karte."""
+        label, sender = self.accounts[self._admin_i % len(self.accounts)]
+        self._admin_i += 1
+        return label, sender, self.gates[label], self._admin_i % len(self.accounts)
+
+    def free_account(self, skip_idx: int):
+        """Flood me ho aur wait na karna ho to agla free account."""
+        for offset in range(1, len(self.accounts)):
+            idx = (skip_idx + offset) % len(self.accounts)
+            label, sender = self.accounts[idx]
+            if self.gates[label].pause_until <= time.monotonic():
+                return label, sender, self.gates[label], idx
+        return None
+
+    def stats(self) -> str:
+        return " · ".join(f"{label}:{self.gates[label].sent}" for label in self.labels)
+
+    def flood_list(self) -> list:
+        now = time.monotonic()
+        return [
+            f"{label}({int(self.gates[label].pause_until - now)}s)"
+            for label in self.labels
+            if self.gates[label].pause_until > now
+        ]
+
+    async def close(self):
+        for label, sender in self.accounts:
+            try:
+                await sender.close()
+            except Exception:
+                pass
+
+
+class BotAccount:
+    """Ek bot token = ek account (apna flood window). Pool inhe round-robin use karta hai."""
+
+    def __init__(self, token: str, channel, admin, label: str = "bot"):
+        self.base = f"https://api.telegram.org/bot{token}"
+        self.channel = channel
+        self.admin = admin
+        self.label = label
+
+    async def _call(self, client, method: str, payload: dict):
+        response = await client.post(f"{self.base}/{method}", json=payload, timeout=40.0)
+        try:
+            data = response.json()
+        except Exception:
+            raise RuntimeError(f"Telegram invalid response: {response.text[:150]}")
+        if data.get("ok"):
+            return data
+        retry_after = (data.get("parameters") or {}).get("retry_after")
+        if retry_after or data.get("error_code") == 429:
+            raise FloodWait(int(retry_after or 30), str(data.get("description")))
+        raise RuntimeError(f"Telegram {data.get('error_code')}: {data.get('description')}")
+
+    async def send_message(self, client, chat, text: str, parse_mode: str = "HTML") -> None:
+        payload = {
+            "chat_id": str(chat),
+            "text": text,
+            "disable_web_page_preview": True,
+            "disable_notification": True,
+        }
+        if parse_mode:
+            payload["parse_mode"] = parse_mode
+        await self._call(client, "sendMessage", payload)
+
+    async def send_record(self, client, text: str, file=None, caption: str = None) -> None:
+        if file:
+            files = {"document": (file[0], file[1], "application/json")}
+            payload = {"chat_id": str(self.channel), "caption": (caption or text)[:1000],
+                       "parse_mode": "HTML",
+                       "disable_notification": "true"}
+            response = await client.post(f"{self.base}/sendDocument",
+                                         data=payload, files=files, timeout=60.0)
+            body = response.json()
+            if not body.get("ok"):
+                retry_after = (body.get("parameters") or {}).get("retry_after")
+                if retry_after or body.get("error_code") == 429:
+                    raise FloodWait(int(retry_after or 30), str(body.get("description")))
+                raise RuntimeError(f"Telegram {body.get('error_code')}: {body.get('description')}")
+        else:
+            await self.send_message(client, self.channel, text)
+
+    async def send_admin(self, client, text: str) -> None:
+        if self.admin is not None:
+            await self.send_message(client, self.admin, text)
+
+
+class MtprotoAccount:
+    """Ek api_id/api_hash (+ bot token) = ek account."""
+
+    def __init__(self, api_id: int, api_hash: str, bot_token: str, channel, admin,
+                 label: str = "mtproto"):
+        from telethon import TelegramClient
+        from telethon.sessions import StringSession
+
+        self.client = TelegramClient(StringSession(), api_id, api_hash)
+        self.bot_token = bot_token
+        self.channel = channel
+        self.admin = admin
+        self.label = label
+
+    async def start(self):
+        if self.bot_token:
+            await self.client.start(bot_token=self.bot_token)
+        else:
+            await self.client.start()
+        me = await self.client.get_me()
+        log.info("%s connected as @%s (id %s)", self.label,
+                 getattr(me, "username", None), me.id)
+
+    async def _send(self, chat, text=None, file=None):
+        from telethon.errors import FloodWaitError, SlowModeWaitError
+        try:
+            if file:
+                from io import BytesIO
+                from telethon.tl.types import DocumentAttributeFilename
+                await self.client.send_file(
+                    chat, BytesIO(file[1]),
+                    caption=(text or "")[:900],
+                    force_document=True,
+                    attributes=[DocumentAttributeFilename(file[0])],
+                )
+            else:
+                await self.client.send_message(chat, text, link_preview=False, parse_mode="html")
+        except (FloodWaitError, SlowModeWaitError) as exc:
+            raise FloodWait(getattr(exc, "seconds", 30), str(exc))
+
+    async def send_record(self, text: str, file=None) -> None:
+        await self._send(self.channel, text, file)
+
+    async def send_admin(self, text: str) -> None:
+        if self.admin is not None:
+            await self._send(self.admin, text)
+
+    async def close(self):
+        try:
+            await self.client.disconnect()
+        except Exception:
+            pass
+
+
+# -------------------------------------------------------------------- progress
+
+STATS_HOLDER: dict = {}
+
+def progress_text(state: dict, elapsed: float, speed: float) -> str:
+    total = int(state.get("total") or 0)
+    sent = int(state.get("sent") or 0)
+    offset = int(state.get("offset") or 0)
+    messages = int(state.get("messages") or 0)
+    remaining = max(0, total - offset) if total else None
+    pct = (offset / total * 100) if total else 0.0
+    eta_min = (remaining / speed / 60) if (speed > 0 and remaining) else 0
+    msg_speed = (messages / elapsed) if elapsed > 0 else 0.0
+
+    if total and remaining == 0:
+        tail = "🎉 Poora ho gaya (100%)"
+    elif remaining is None:
+        tail = "🕒 ETA: total pata chalte hi"
+    else:
+        tail = f"🕒 ETA: {eta_min:.1f} min"
+
+    return "\n".join([
+        "📊 EXPORT PROGRESS",
+        f"🗂 {HF_DATASET} · {HF_CONFIG}/{HF_SPLIT}",
+        f"✅ Records sent: {sent}",
+        f"📨 Messages: {messages} ({msg_speed:.2f}/s · {msg_speed * 60:.0f}/min)",
+        f"📈 Position: {offset}/{total or '?'} ({pct:.1f}%)",
+        f"⏳ Baaki: {remaining if remaining is not None else '?'}",
+        f"⚡ Speed: {speed:.1f} rec/s · {speed * 60:.0f} rec/min · ⏱ {elapsed / 60:.1f} min",
+        tail,
+        f"🔧 {MODE} · {BATCH_MODE} batch(max {BATCH_SIZE}) · in-flight {CONCURRENCY} · delay {DELAY}s",
+    ] + (
+        [f"👥 Accounts: {STATS_HOLDER['pool'].stats()}"]
+        + ([f"⏳ Flood: {' '.join(STATS_HOLDER['pool'].flood_list())}"]
+           if STATS_HOLDER["pool"].flood_list() else [])
+        if STATS_HOLDER.get("pool") else []
+    ))
+
+
+# ------------------------------------------------------------------------ run
+
+async def run() -> None:
+    problems = []
+    if not HF_DATASET:
+        problems.append("HF_DATASET missing (username/dataset)")
+    if not CHANNEL_ID:
+        problems.append("CHANNEL_ID missing (-100... private channel)")
+    if not POOL:
+        problems.append("koi account nahi mila — BOT_TOKEN ya API_IDS/API_HASHES/BOT_TOKENS "
+                        "ya ACCOUNTS=api_id:api_hash:token")
+    if problems:
+        for item in problems:
+            log.error("❌ %s", item)
+        return
+
+    channel = as_chat_id(CHANNEL_ID)
+    admin = as_chat_id(ADMIN_ID) if ADMIN_ID else None
+
+    log.info("MODE=%s | accounts=%s | batch=%s(max %s, %s chars) | in-flight=%s | delay=%ss",
+             MODE, len(POOL), BATCH_MODE, BATCH_SIZE, MSG_CHARS, CONCURRENCY, DELAY)
+
+    state = load_state()
+    stop = asyncio.Event()
+
+    def _signal(*_):
+        log.warning("🛑 stop signal -> pending messages ke baad rukunga")
+        stop.set()
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            asyncio.get_event_loop().add_signal_handler(sig, _signal)
+        except (NotImplementedError, RuntimeError):
+            signal.signal(sig, _signal)
+
+    # ---------------- accounts setup (1..N) ----------------
+    accounts = []
+    http_client = None
+
+    for idx, acc in enumerate(POOL, start=1):
+        label = f"acc{idx}"
+        api_id, api_hash, token = acc["api_id"], acc["api_hash"], acc["bot_token"]
+
+        if MODE == "user" and api_id and api_hash:
+            if token and idx > 1 and LOGIN_STAGGER > 0:
+                await asyncio.sleep(LOGIN_STAGGER)     # ek saath login na karein
+            acc_obj = MtprotoAccount(api_id, api_hash, token, channel, admin, label=label)
+            await acc_obj.start()
+            accounts.append((label, acc_obj))
+        elif token:
+            if http_client is None:
+                http_client = httpx.AsyncClient(timeout=60.0)
+            accounts.append((label, BotAccount(token, channel, admin, label=label)))
+        else:
+            log.warning("%s skip — api_id/api_hash ya bot_token missing", label)
+
+    if not accounts:
+        log.error("❌ koi valid account nahi mila (BOT_TOKEN / API_ID+API_HASH check karo)")
+        return
+
+    pool = AccountPool(accounts, wait_for_account=WAIT_FOR_ACCOUNT)
+    STATS_HOLDER["pool"] = pool
+    log.info("ACCOUNTS: %s (total %s, in-flight %s) | pattern: %s | flood par: %s",
+             ", ".join(pool.labels), len(pool), CONCURRENCY,
+             " → ".join(pool.labels + [pool.labels[0]]),
+             "wait (order safe)" if WAIT_FOR_ACCOUNT else "agla free account")
+
+    async def raw_send(label, text, file=None, caption=None):
+        sender = pool.senders[label]
+        if isinstance(sender, MtprotoAccount):
+            await sender.send_record(text, file)
+        else:
+            await sender.send_record(http_client, text, file, caption)
+
+    async def send_admin(text):
+        label, sender, gate, _idx = pool.assign_admin()
+        try:
+            if isinstance(sender, MtprotoAccount):
+                await sender.send_admin(text)
+            else:
+                await sender.send_admin(http_client, text)
+        except Exception as exc:
+            log.warning("admin message fail (%s)", exc)
+
+    async def close_sender():
+        await pool.close()
+        if http_client is not None:
+            await http_client.aclose()
+
+    async def send_one(text, file=None, caption=None, slot=None):
+        """
+        slot = is message ka account number (strict alternate). Flood-wait par:
+          WAIT_FOR_ACCOUNT=1 -> usi slot ka intezaar (order + pattern intact)
+          WAIT_FOR_ACCOUNT=0 -> agla free account (fast, pattern thoda tootega)
+        Record kabhi skip nahi hota — fail hone par exception (offset aage nahi badhta).
+        """
+        if slot is None:
+            label, sender, gate, idx = pool.assign()
+        else:
+            label, sender, gate, idx = slot
+
+        attempts = 0
+        while True:
+            await gate.wait()
+            try:
+                await raw_send(label, text, file, caption)
+                gate.sent += 1
+                return label
+            except FloodWait as exc:
+                gate.errors += 1
+                await gate.pause(exc.seconds)
+                if not pool.wait_for_account:
+                    alt = pool.free_account(idx)
+                    if alt:
+                        label, sender, gate, idx = alt
+                        log.info("↪️ [%s] flood me hai -> [%s] se bhej raha hoon", 
+                                 pool.labels[idx], label)
+            except Exception as exc:
+                gate.errors += 1
+                attempts += 1
+                if attempts >= MAX_RETRIES * max(1, len(pool)):
+                    raise
+                wait = min(15, 1.5 ** min(attempts, 5))
+                log.warning("[%s] send error (%s) -> %.1fs baad retry", label, exc, wait)
+                await asyncio.sleep(wait)
+
+    hf_client = httpx.AsyncClient(headers=hf_headers(), timeout=60.0)
+    reader = HfReader(hf_client)
+
+    started_at = time.monotonic()
+    last_progress = 0.0
+    session_sent = 0
+    session_msgs = 0
+    saved = 0
+    started_offset = int(state["offset"])
+
+    async def push_progress(force: bool = False):
+        nonlocal last_progress
+        now = time.monotonic()
+        if not force and (now - last_progress) < PROGRESS_EVERY:
+            return
+        last_progress = now
+        elapsed = now - started_at
+        try:
+            await send_admin(progress_text(state, elapsed,
+                                          (session_sent / elapsed) if elapsed else 0.0))
+        except Exception as exc:
+            log.warning("progress send fail: %s", exc)
+
+    window: collections.deque = collections.deque()     # in-flight send tasks
+    inflight: collections.deque = collections.deque()   # (start_offset, count)
+
+    def commit(start_offset: int, count: int):
+        nonlocal session_sent, session_msgs, saved
+        state["offset"] = start_offset + count
+        state["sent"] = int(state.get("sent") or 0) + count
+        state["messages"] = int(state.get("messages") or 0) + 1
+        session_sent += count
+        session_msgs += 1
+        saved += 1
+
+    try:
+        try:
+            first_record, warm_total = await reader.get(int(state["offset"]))
+            if warm_total:
+                state["total"] = warm_total
+            if first_record is None and warm_total:
+                state["finished"] = True
+                log.info("Dataset khatam (offset %s / total %s)", state["offset"], warm_total)
+        except Exception as exc:
+            log.warning("warmup fail (%s) — chalta rahega", exc)
+
+        save_state(state)
+        await push_progress(force=True)
+        try:
+            await send_admin(
+                f"▶️ START\n🗂 {html_escape(HF_DATASET)} · {HF_CONFIG}/{HF_SPLIT}\n"
+                f"📍 resume offset: {started_offset}\n"
+                f"📦 batch: {BATCH_MODE} (max {BATCH_SIZE} records / {MSG_CHARS} chars per message)\n"
+                f"🔧 {MODE} · concurrency {CONCURRENCY} · delay {DELAY}s\n🕒 {now_iso()}"
+            )
+        except Exception:
+            pass
+
+        failure = None
+
+        while not stop.is_set() and not state.get("finished"):
+            assigned = sum(count for _, count in inflight)
+            start_offset = int(state["offset"]) + assigned
+
+            if END_OFFSET and start_offset >= END_OFFSET:
+                log.info("END_OFFSET (%s) -> ruk gaya", END_OFFSET)
+                break
+
+            # ---- records taiyar karo (max BATCH_SIZE) ----
+            items = []
+            for i in range(BATCH_SIZE):
+                try:
+                    record, total = await reader.get(start_offset + i)
+                except Exception as exc:
+                    state["last_error"] = str(exc)
+                    save_state(state)
+                    log.error("HF read fail: %s -> 20s retry", exc)
+                    await asyncio.sleep(20)
+                    break
+                if total:
+                    state["total"] = total
+                if record is None:
+                    break
+                items.append((start_offset + i, record))
+
+            if not items:
+                state["finished"] = True
+                break
+
+            text, caption, file, count = build_batch(items, int(state["total"]))
+            slot = pool.assign()          # strict: msg1->acc1, msg2->acc2, ...
+            window.append(asyncio.create_task(send_one(text, file, caption, slot)))
+            inflight.append((start_offset, count))
+
+            while len(window) >= CONCURRENCY:
+                try:
+                    await window.popleft()
+                except Exception as exc:
+                    failure = exc
+                    break
+                off, cnt = inflight.popleft()
+                commit(off, cnt)
+                if saved >= STATE_SAVE_EVERY:
+                    save_state(state)
+                    saved = 0
+                await push_progress()
+                if DELAY:
+                    await asyncio.sleep(DELAY)
+
+            if failure:
+                break
+            # NOTE: yahan 'ended' par break NAHI karte — agar batch partial tha
+            # (auto mode me kam records fit hue) to baaki records agle loop me jayenge.
+            # Data khatam hone par agli baar reader None dega -> finished.
+
+        while window:
+            try:
+                await window.popleft()
+            except Exception as exc:
+                failure = failure or exc
+                inflight.popleft()
+                continue
+            off, cnt = inflight.popleft()
+            commit(off, cnt)
+
+        if failure:
+            state["last_error"] = str(failure)
+            save_state(state)
+            log.error("❌ send fail: %s — offset %s par saved (resume possible)",
+                      failure, state["offset"])
+            try:
+                await send_admin(f"⚠️ Error: {failure}\n📍 offset {state['offset']} par ruka — "
+                                 f"restart karne par yahin se chalega.")
+            except Exception:
+                pass
+
+        if state["total"] and state["offset"] >= int(state["total"]):
+            state["finished"] = True
+
+    finally:
+        save_state(state)
+        elapsed = time.monotonic() - started_at
+        speed = (session_sent / elapsed) if elapsed > 0 else 0.0
+        try:
+            await send_admin("⏹ STOPPED\n" + progress_text(state, elapsed, speed) +
+                             f"\n💾 state: {STATE_FILE}")
+        except Exception:
+            pass
+        await close_sender()
+        await hf_client.aclose()
+        log.info("STOP · sent %s · messages(is session) %s · offset %s · %.1f rec/s",
+                 state.get("sent"), session_msgs, state.get("offset"), speed)
+
+
+def main() -> None:
+    try:
+        asyncio.run(run())
+    except KeyboardInterrupt:
+        log.warning("KeyboardInterrupt")
+
+
+if __name__ == "__main__":
+    main()
