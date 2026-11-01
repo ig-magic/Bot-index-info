@@ -1,0 +1,62 @@
+# Render WEB SERVICE blueprint — ek hi file: HTTP server + exporter + dashboard
+services:
+  - type: web
+    name: dataset-tg-exporter
+    runtime: python
+    plan: starter              # free plan 15 min baad sleep karta hai -> paid recommended
+    region: singapore
+    buildCommand: pip install -r requirements.txt
+    startCommand: python exporter.py
+    healthCheckPath: /health   # Render isi se healthy maanta hai
+    autoDeploy: true
+    envVars:
+      - key: HF_DATASET
+        sync: false
+      - key: HF_TOKEN
+        sync: false
+      - key: HF_CONFIG
+        value: default
+      - key: HF_SPLIT
+        value: train
+      - key: CHANNEL_ID
+        sync: false
+      - key: ADMIN_ID
+        sync: false
+      - key: API_IDS
+        sync: false
+      - key: API_HASHES
+        sync: false
+      - key: BOT_TOKENS
+        sync: false
+      - key: MODE
+        value: auto
+      - key: BATCH_MODE
+        value: auto
+      - key: BATCH_SIZE
+        value: "20"
+      - key: MSG_CHARS
+        value: "3800"
+      - key: PER_ACCOUNT_CONCURRENCY
+        value: "4"
+      - key: DELAY
+        value: "0"
+      - key: LOGIN_STAGGER
+        value: "0.8"
+      - key: WAIT_FOR_ACCOUNT
+        value: "1"
+      - key: PROGRESS_EVERY
+        value: "10"
+      - key: STATE_FILE
+        value: /var/data/state.json
+      - key: MAX_TRIM_KB
+        value: "8"
+      - key: WEB
+        value: "1"
+      - key: WEB_TOKEN
+        sync: false             # /stop /start /reset ke liye secret
+      - key: DRY_RUN
+        value: "0"
+    disk:
+      name: exporter-data
+      mountPath: /var/data
+      sizeGB: 1
