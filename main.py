@@ -206,6 +206,12 @@ if MODE_RAW == "auto":
 WAIT_FOR_ACCOUNT = env("WAIT_FOR_ACCOUNT", "1") not in ("0", "false", "no")
 # MTProto logins ek saath na ho (FLOOD_WAIT se bachne ke liye) — chhota gap
 LOGIN_STAGGER = env_float("LOGIN_STAGGER", 0.8)
+
+# ---- Render web service ----
+PORT = env_int("PORT", 0)                      # Render isko khud deta hai
+WEB = env("WEB", "auto").lower()               # auto = PORT mile to server chalu
+WEB_TOKEN = env("WEB_TOKEN")                   # control endpoints (/stop /start) ke liye
+DRY_RUN = env("DRY_RUN", "0") in ("1", "true", "yes")   # Telegram ko chhode bina test
 PER_ACCOUNT = env_int("PER_ACCOUNT_CONCURRENCY", env_int("CONCURRENCY", 4))
 PER_ACCOUNT = max(1, min(16, PER_ACCOUNT))
 
@@ -785,8 +791,11 @@ async def run() -> None:
     log.info("MODE=%s | accounts=%s | batch=%s(max %s, %s chars) | in-flight=%s | delay=%ss",
              MODE, len(POOL), BATCH_MODE, BATCH_SIZE, MSG_CHARS, CONCURRENCY, DELAY)
 
+    global STOP_EVENT
+    if STOP_EVENT is None:
+        STOP_EVENT = asyncio.Event()
+    stop = STOP_EVENT
     state = load_state()
-    stop = asyncio.Event()
 
     def _signal(*_):
         log.warning("🛑 stop signal -> pending messages ke baad rukunga")
@@ -831,6 +840,10 @@ async def run() -> None:
              "wait (order safe)" if WAIT_FOR_ACCOUNT else "agla free account")
 
     async def raw_send(label, text, file=None, caption=None):
+        if DRY_RUN:
+            log.info("[DRY_RUN][%s] would send: %s", label, text.split("\n")[0])
+            await asyncio.sleep(0.05)
+            return
         sender = pool.senders[label]
         if isinstance(sender, MtprotoAccount):
             await sender.send_record(text, file)
@@ -1043,11 +1056,369 @@ async def run() -> None:
                  state.get("sent"), session_msgs, state.get("offset"), speed)
 
 
-def main() -> None:
+# ==============================================================================
+#  RENDER WEB SERVICE  (health check + dashboard + start/stop control)
+# ==============================================================================
+
+STOP_EVENT: "asyncio.Event | None" = None
+JOB: dict = {"running": False, "started_at": "", "stopped_at": "", "last_error": "",
+             "restarts": 0, "task": None}
+WEB_STATE = {"listeners": 0, "peak": 0, "boot": now_iso()}
+
+
+def status_snapshot() -> dict:
+    """Live status (dashboard + /status) — state file se padhta hai."""
+    data = dict(DEFAULT_STATE)
     try:
-        asyncio.run(run())
-    except KeyboardInterrupt:
-        log.warning("KeyboardInterrupt")
+        with open(STATE_FILE, "r", encoding="utf-8") as handle:
+            data.update(json.load(handle) or {})
+    except Exception:
+        pass
+
+    total = int(data.get("total") or 0)
+    offset = int(data.get("offset") or 0)
+    sent = int(data.get("sent") or 0)
+    remaining = max(0, total - offset) if total else None
+
+    started = JOB.get("started_at") or data.get("started_at") or ""
+    elapsed = 0.0
+    if started:
+        try:
+            elapsed = (datetime.now(timezone.utc)
+                       - datetime.fromisoformat(started)).total_seconds()
+        except Exception:
+            elapsed = 0.0
+    speed = (sent / elapsed) if elapsed > 0 else 0.0
+
+    return {
+        "exporter": ("running" if JOB["running"]
+                     else ("finished" if data.get("finished") else "stopped")),
+        "pid_started": JOB.get("started_at"),
+        "restarts": JOB.get("restarts", 0),
+        "last_error": JOB.get("last_error") or data.get("last_error") or "",
+        "dataset": data.get("dataset") or HF_DATASET,
+        "config": data.get("config") or HF_CONFIG,
+        "split": data.get("split") or HF_SPLIT,
+        "total": total,
+        "offset": offset,
+        "sent": sent,
+        "messages": int(data.get("messages") or 0),
+        "remaining": remaining,
+        "percent": round((offset / total * 100), 2) if total else 0.0,
+        "finished": bool(data.get("finished")),
+        "elapsed_sec": int(elapsed),
+        "speed_rec_per_sec": round(speed, 2),
+        "eta_sec": int(remaining / speed) if (speed and remaining) else None,
+        "accounts": {"count": len(POOL), "mode": MODE,
+                     "labels": [f"acc{i}" for i in range(1, len(POOL) + 1)],
+                     "in_flight": CONCURRENCY, "wait_for_account": WAIT_FOR_ACCOUNT},
+        "config_used": {
+            "batch_mode": BATCH_MODE, "batch_size": BATCH_SIZE, "msg_chars": MSG_CHARS,
+            "per_account": PER_ACCOUNT, "delay": DELAY, "dry_run": DRY_RUN,
+        },
+        "state_file": STATE_FILE,
+        "updated_at": data.get("updated_at"),
+        "web": {"listeners": WEB_STATE["listeners"], "boot": WEB_STATE["boot"]},
+    }
+
+
+DASHBOARD_HTML = """<!DOCTYPE html><html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Exporter · Live</title>
+<style>
+ :root{color-scheme:dark}
+ *{box-sizing:border-box}
+ body{margin:0;padding:18px;background:#0a0e18;color:#e6e9f2;
+   font:14px/1.55 ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Arial}
+ .wrap{max-width:760px;margin:0 auto}
+ h1{font-size:17px;margin:0 0 4px}
+ .sub{color:#8b93a7;font-size:12.5px;margin-bottom:16px}
+ .card{background:#111827;border:1px solid #1f2740;border-radius:14px;padding:16px;margin-bottom:12px}
+ .row{display:flex;justify-content:space-between;gap:12px;padding:7px 0;border-bottom:1px solid #1b2237;font-size:13.5px}
+ .row:last-child{border-bottom:0}
+ .k{color:#8b93a7}
+ .v{font-weight:600;font-family:ui-monospace,Menlo,monospace;text-align:right;word-break:break-all}
+ .bar{height:10px;border-radius:99px;background:#1b2237;overflow:hidden;margin:12px 0 6px}
+ .fill{height:100%;width:0;background:linear-gradient(90deg,#2b6ef6,#5ee1a0);transition:width .4s}
+ .pill{display:inline-block;font-size:11px;padding:3px 10px;border-radius:99px;
+   background:#16203a;border:1px solid #1f2740;color:#9fb4dd;font-family:ui-monospace,Menlo,monospace}
+ .ok{color:#5ee1a0}.bad{color:#ff9ba8}
+</style></head><body><div class="wrap">
+<h1>Exporter <span class="pill" id="mode">—</span> <span class="pill" id="live">live</span></h1>
+<div class="sub" id="sub">loading…</div>
+<div class="card">
+  <div class="row"><span class="k">Records sent</span><span class="v" id="sent">—</span></div>
+  <div class="bar"><div class="fill" id="fill"></div></div>
+  <div class="row"><span class="k">Position</span><span class="v" id="pos">—</span></div>
+  <div class="row"><span class="k">Remaining</span><span class="v" id="rem">—</span></div>
+  <div class="row"><span class="k">Messages</span><span class="v" id="msgs">—</span></div>
+  <div class="row"><span class="k">Speed</span><span class="v" id="speed">—</span></div>
+  <div class="row"><span class="k">ETA</span><span class="v" id="eta">—</span></div>
+</div>
+<div class="card">
+  <div class="row"><span class="k">Accounts</span><span class="v" id="acc">—</span></div>
+  <div class="row"><span class="k">Batch</span><span class="v" id="batch">—</span></div>
+  <div class="row"><span class="k">State file</span><span class="v" id="sf">—</span></div>
+  <div class="row"><span class="k">Last error</span><span class="v" id="err">—</span></div>
+</div>
+</div>
+<script>
+const $=id=>document.getElementById(id);
+const fmt=s=>s==null?"—":(s>=3600?`${(s/3600).toFixed(1)}h`:(s>=60?`${(s/60).toFixed(1)}m`:`${s}s`));
+async function tick(){
+  try{
+    const r=await fetch("/status");const d=await r.json();
+    $("mode").textContent=d.exporter.toUpperCase()+" · "+d.config_used.batch_mode;
+    $("mode").className="pill "+(d.exporter==="running"?"ok":"bad");
+    $("sub").textContent=`${d.dataset} · ${d.config}/${d.split} · restarts ${d.restarts} · updated ${d.updated_at||"—"}`;
+    $("sent").textContent=d.sent;
+    $("fill").style.width=(d.percent||0)+"%";
+    $("pos").textContent=`${d.offset} / ${d.total||"?"} (${d.percent}%)`;
+    $("rem").textContent=d.remaining==null?"?":d.remaining;
+    $("msgs").textContent=d.messages;
+    $("speed").textContent=d.speed_rec_per_sec+" rec/s";
+    $("eta").textContent=d.eta_sec==null?"—":fmt(d.eta_sec);
+    $("acc").textContent=`${d.accounts.count} × ${d.accounts.mode} · in-flight ${d.accounts.in_flight}`;
+    $("batch").textContent=`${d.config_used.batch_size}/msg · ${d.config_used.msg_chars} chars${d.config_used.dry_run?" · DRY RUN":""}`;
+    $("sf").textContent=d.state_file;
+    $("err").textContent=d.last_error||"—";
+    $("live").textContent="live"; $("live").className="pill ok";
+  }catch(e){ $("live").textContent="offline"; $("live").className="pill bad"; }
+}
+tick(); setInterval(tick, 3000);
+</script></body></html>"""
+
+
+def build_web_app():
+    """Chhota stdlib HTTP server — koi extra dependency nahi."""
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    import urllib.parse
+
+    class Handler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def log_message(self, fmt, *args):        # Render logs clean rakho
+            return
+
+        def _send(self, code: int, body: bytes, ctype: str = "application/json"):
+            self.send_response(code)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            try:
+                self.wfile.write(body)
+            except Exception:
+                pass
+
+        def _json(self, code: int, payload: dict):
+            self._send(code, json.dumps(payload, ensure_ascii=False, indent=2).encode(),
+                       "application/json; charset=utf-8")
+
+        def _auth_ok(self) -> bool:
+            if not WEB_TOKEN:
+                return True
+            token = self.headers.get("x-token") or ""
+            query = urllib.parse.urlparse(self.path).query
+            if not token:
+                token = urllib.parse.parse_qs(query).get("token", [""])[0]
+            return token == WEB_TOKEN
+
+        def _loop(self):
+            return getattr(self.server, "loop", None)
+
+        def do_GET(self):
+            path = urllib.parse.urlparse(self.path).path.rstrip("/") or "/"
+            WEB_STATE["listeners"] += 1
+            WEB_STATE["peak"] = max(WEB_STATE["peak"], WEB_STATE["listeners"])
+            try:
+                if path in ("/", "/dashboard", "/ui"):
+                    self._send(200, DASHBOARD_HTML.encode(), "text/html; charset=utf-8")
+                elif path in ("/health", "/healthz", "/api/health"):
+                    snap = status_snapshot()
+                    self._json(200, {"status": "ok", "service": "dataset-tg-exporter",
+                                     "exporter": snap["exporter"],
+                                     "sent": snap["sent"], "total": snap["total"],
+                                     "percent": snap["percent"],
+                                     "boot": WEB_STATE["boot"]})
+                elif path in ("/status", "/api/status", "/progress"):
+                    self._json(200, status_snapshot())
+                elif path in ("/stop", "/pause", "/api/stop"):
+                    if not self._auth_ok():
+                        return self._json(401, {"ok": False, "error": "unauthorized (x-token)"})
+                    loop, event = self._loop(), STOP_EVENT
+                    if loop and event and not event.is_set():
+                        loop.call_soon_threadsafe(event.set)
+                    JOB["stopped_at"] = now_iso()
+                    self._json(200, {"ok": True, "action": "stop",
+                                     "note": "current message ke baad rukega, state saved"})
+                elif path in ("/state", "/api/state"):
+                    try:
+                        with open(STATE_FILE, "r", encoding="utf-8") as fh:
+                            self._json(200, {"ok": True, "state_file": STATE_FILE,
+                                             "state": json.load(fh)})
+                    except Exception as exc:
+                        self._json(200, {"ok": False, "error": str(exc),
+                                         "state_file": STATE_FILE})
+                elif path in ("/reset", "/api/reset"):
+                    if not self._auth_ok():
+                        return self._json(401, {"ok": False, "error": "unauthorized (x-token)"})
+                    if JOB["running"]:
+                        return self._json(409, {"ok": False,
+                                                "error": "pehle /stop karo, phir /reset"})
+                    try:
+                        if os.path.exists(STATE_FILE):
+                            os.replace(STATE_FILE, STATE_FILE + ".bak")
+                        reset = dict(DEFAULT_STATE)
+                        reset["dataset"] = HF_DATASET
+                        reset["config"] = HF_CONFIG
+                        reset["split"] = HF_SPLIT
+                        reset["started_at"] = now_iso()
+                        with open(STATE_FILE, "w", encoding="utf-8") as fh:
+                            json.dump(reset, fh, separators=(",", ":"))
+                        self._json(200, {"ok": True, "action": "reset",
+                                         "note": "state reset (purana state.json.bak me)",
+                                         "state_file": STATE_FILE})
+                    except Exception as exc:
+                        self._json(500, {"ok": False, "error": str(exc)})
+                elif path in ("/start", "/resume", "/api/start"):
+                    if not self._auth_ok():
+                        return self._json(401, {"ok": False, "error": "unauthorized (x-token)"})
+                    loop = self._loop()
+                    if loop and not JOB["running"]:
+                        loop.call_soon_threadsafe(start_job)
+                        self._json(200, {"ok": True, "action": "start",
+                                         "note": "state file se resume hoga"})
+                    else:
+                        self._json(200, {"ok": True, "action": "start",
+                                         "note": "pehle se chal raha hai"})
+                else:
+                    self._json(404, {"error": "not found",
+                                     "routes": ["/", "/health", "/status", "/stop", "/start"]})
+            finally:
+                WEB_STATE["listeners"] -= 1
+
+        do_POST = do_GET
+
+    port = PORT or 8080
+    server = ThreadingHTTPServer(("0.0.0.0", port), Handler)
+    server.daemon_threads = True
+    return server
+
+
+async def start_web_server(loop) -> None:
+    """HTTP server ko background thread me chalao (asyncio loop block na ho)."""
+    import threading
+
+    server = build_web_app()
+    server.loop = loop
+    thread = threading.Thread(target=server.serve_forever, name="web", daemon=True)
+    thread.start()
+    log.info("🌐 WEB SERVICE live on 0.0.0.0:%s  (health: /health · dashboard: / · control: /stop,/start)",
+             PORT or 8080)
+
+
+def start_job() -> None:
+    """Exporter ko naye task ke roop me chalao (restart safe)."""
+    if JOB["running"]:
+        return
+    JOB["running"] = True
+    JOB["started_at"] = now_iso()
+    JOB["restarts"] = JOB.get("restarts", 0) + 1
+    if asyncio.get_event_loop().is_closed():
+        return
+    task = asyncio.ensure_future(supervise())
+    JOB["task"] = task
+
+
+async def supervise() -> None:
+    """
+    run() ko chalata hai; crash hone par 15s baad WAHIN se restart karta hai
+    (state.json se resume) — Render web service 24x7 healthy rehti hai.
+    """
+    global STOP_EVENT
+    while True:
+        if STOP_EVENT is None or STOP_EVENT.is_set():
+            STOP_EVENT = asyncio.Event()
+        try:
+            await run()
+            JOB["last_error"] = ""
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            JOB["last_error"] = str(exc)
+            log.exception("run() crash: %s -> 15s baad resume", exc)
+            await asyncio.sleep(15)
+            continue
+        finally:
+            JOB["stopped_at"] = now_iso()
+
+        # normal exit (finished / stop) -> web service chalta rahega, dobara start nahi
+        JOB["running"] = False
+        log.info("exporter ruk gaya (finished/stop). Web service live hai — /start se dobara chala sakte ho.")
+        return
+
+
+def main() -> None:
+    """
+    Render WEB SERVICE entry point:
+      • HTTP server (PORT) chalta rehta hai -> Render health check pass
+      • exporter usi process me background task ke roop me chalta hai
+      • kaam khatam hone par bhi process zinda rehta hai (Render crash nahi dikhata)
+      • /stop, /start, /reset endpoints se control
+    """
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
+    global STOP_EVENT
+    STOP_EVENT = asyncio.Event()
+
+    web_enabled = bool(PORT) or WEB in ("1", "true", "yes")
+    if web_enabled:
+        try:
+            loop.run_until_complete(start_web_server(loop))
+        except Exception as exc:
+            log.error("web server start fail (%s) — sirf exporter chalega", exc)
+
+    if DRY_RUN:
+        log.warning("🧪 DRY_RUN=1 — Telegram par kuch nahi jayega (sirf log)")
+
+    if not POOL:
+        log.error("❌ koi account nahi mila — Render env me API_IDS/API_HASHES/BOT_TOKENS daalo")
+    else:
+        start_job()
+
+    # graceful shutdown (Render deploy/stop par SIGTERM bhejta hai)
+    def _shutdown(*_):
+        log.warning("SIGTERM/SIGINT -> state save karke band ho raha hoon")
+        if STOP_EVENT and not STOP_EVENT.is_set():
+            loop.call_soon_threadsafe(STOP_EVENT.set)
+        loop.call_later(3.0, loop.stop)
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            loop.add_signal_handler(sig, _shutdown)
+        except (NotImplementedError, RuntimeError):
+            pass
+
+    if web_enabled:
+        log.info("web service ke saath exporter chal raha hai — loop forever")
+        try:
+            loop.run_forever()
+        except KeyboardInterrupt:
+            pass
+        finally:
+            try:
+                log.info("shutdown · sent %s · state %s",
+                         status_snapshot().get("sent"), STATE_FILE)
+            except Exception:
+                pass
+    else:
+        # sirf worker (Render background worker / VPS)
+        try:
+            loop.run_until_complete(supervise())
+        except KeyboardInterrupt:
+            log.warning("KeyboardInterrupt")
 
 
 if __name__ == "__main__":
