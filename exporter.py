@@ -136,6 +136,19 @@ HF_PREFETCH = max(0, env_int("HF_PREFETCH", 3))     # aage ke kitne 100-row chun
 # HF datasets-server bhi rate-limit karta hai (bina token ~1 req/sec). Bahut parallel
 # prefetch = 429 = "evaluate ok but 0 rows" jaisa behaviour. Ye throttle usse rokta hai.
 HF_MIN_INTERVAL = env_float("HF_MIN_INTERVAL", 0.3)  # do HF requests ke beech min gap (sec)
+# ★ DEFAULT = SKIP NAHI, RETRY. Ek record bhi miss nahi hoga.
+#   HF_MAX_ATTEMPTS = ek page par kitni koshish (phir HF_RETRY_FOREVER tak)
+HF_MAX_ATTEMPTS = max(1, env_int("HF_MAX_ATTEMPTS", 5))
+#   1 = koshish khatam hone par bhi rukna nahi — 30s/60s/120s... ruk kar retry karta raho
+#       (record kabhi skip nahi hota; Render service zinda rehti hai)
+HF_RETRY_FOREVER = (env("HF_RETRY_FOREVER", "1") or "1").strip().lower() in ("1","true","yes","on","y")
+#   0 = besharam mode: agar aap phir bhi chahte ho ki fail page skip ho jaye.
+HF_SKIP_ON_FAIL = (env("HF_SKIP_ON_FAIL", "0") or "0").strip().lower() in ("1","true","yes","on","y")
+
+# SEQUENCE=1 -> GUARANTEED order: message 2 tabhi banta hai jab message 1 channel me
+# pahunch chuka ho. Isliye Telegram me posts 100% sequence wise dikhte hain
+# (0.4s/msg ~ 150-200 records/min). SEQUENCE=0 -> fast pipeline (thoda reordering ho sakta hai).
+SEQUENCE = (env("SEQUENCE", "1") or "1").strip().lower() in ("1","true","yes","on","y")
 HF_PAGE = 100                                       # HF /rows max
 # Bot API ka asli limit ~20 msg/min per bot. Isse upar jaate hi 429 (retry_after
 # 1000s+ = 18 min barbaad). Sliding-window limiter limit ke NEECHE rakhta hai
@@ -346,6 +359,7 @@ DEFAULT_STATE = {
     "dataset": "", "config": "", "split": "",
     "offset": 0, "sent": 0, "messages": 0, "total": 0,
     "finished": False, "started_at": "", "updated_at": "", "last_error": "",
+    "skipped_records": 0, "skipped_pages": [],
 }
 
 
@@ -418,6 +432,7 @@ class HfReader:
         self._last_req = 0.0
         self._throttle_lock = asyncio.Lock()
         self.hf_429 = 0
+        self.skipped: list = []              # [{page, rows, error}] — HF fail par chhode gaye pages
 
     async def _throttle(self) -> None:
         """HF requests ko serial pace karo (429 se bachne ke liye)."""
@@ -431,8 +446,13 @@ class HfReader:
             self._last_req = time.monotonic()
 
     async def fetch(self, offset: int, length: int) -> dict:
+        """HF rows laao. Fail par RETRY (skip nahi) — data kabhi chhoota nahi."""
         last_error = ""
-        for attempt in range(1, MAX_RETRIES + 1):
+        attempt = 0
+        while True:
+            attempt += 1
+            if not HF_RETRY_FOREVER and attempt > HF_MAX_ATTEMPTS:
+                raise RuntimeError(f"HF rows fetch failed ({attempt-1} koshish): {last_error}")
             try:
                 await self._throttle()
                 response = await self.client.get(
@@ -448,25 +468,37 @@ class HfReader:
                 )
                 if response.status_code == 429:
                     self.hf_429 += 1
-                    pause = min(60, 5 * (2 ** (attempt - 1)))
-                    log.warning("⏳ HF 429 (rate limit) -> %ss ruk raha hoon", pause)
+                    pause = min(120, 5 * (2 ** min(attempt - 1, 5)))
+                    log.warning("⏳ HF 429 (rate limit) -> %ss baad retry (%s)", pause, attempt)
                     await asyncio.sleep(pause)
                     last_error = "HTTP 429 (HF rate limit)"
                     continue
                 if response.status_code >= 400:
                     last_error = f"HTTP {response.status_code}"
-                    await asyncio.sleep(min(20, 2 * attempt))
+                    pause = min(120, 3 * (2 ** min(attempt - 1, 5)))
+                    log.warning("⚠️  HF %s (offset %s) -> %ss baad retry (%s)",
+                                response.status_code, offset, pause, attempt)
+                    await asyncio.sleep(pause)
                     continue
                 data = response.json()
                 if data.get("error"):
                     last_error = str(data["error"])
-                    await asyncio.sleep(min(20, 2 * attempt))
+                    pause = min(120, 3 * (2 ** min(attempt - 1, 5)))
+                    log.warning("⚠️  HF error (offset %s): %s -> %ss baad retry (%s)",
+                                offset, last_error[:90], pause, attempt)
+                    await asyncio.sleep(pause)
                     continue
+                if attempt > 1:
+                    log.info("✅ HF offset %s mil gaya (%s koshish ke baad)", offset, attempt)
                 return data
+            except asyncio.CancelledError:
+                raise
             except Exception as exc:
-                last_error = str(exc)
-                await asyncio.sleep(min(20, 2 * attempt))
-        raise RuntimeError(f"HF rows fetch failed: {last_error}")
+                last_error = f"{type(exc).__name__}: {exc}"
+                pause = min(120, 3 * (2 ** min(attempt - 1, 5)))
+                log.warning("⚠️  HF network error (offset %s): %s -> %ss baad retry (%s)",
+                            offset, last_error[:90], pause, attempt)
+                await asyncio.sleep(pause)
 
     async def probe(self) -> dict:
         """Startup diagnostic: HF ko wahi sawaal, saaf jawab log me.
@@ -494,8 +526,12 @@ class HfReader:
         if info["features"]:
             log.info("   columns: %s", ", ".join(map(str, info["features"])))
         if info["status"] == 429:
-            log.warning("   ⏳ HF rate-limit (429) — ye aapke IP ka limit hai, config galat nahi. "
-                        "Exporter khud retry karta rahega.")
+            log.warning("   ⏳ HF rate-limit (429) — config galat nahi, IP ka limit hai. "
+                        "Retry chalta rahega (skip nahi).")
+            return info
+        if 500 <= int(info["status"] or 0) < 600:
+            log.warning("   ⏳ HF server busy (%s) — config galat nahi, HF ka temporary issue. "
+                        "Retry chalta rahega (skip nahi, record lost nahi).", info["status"])
             return info
         if info["error"]:
             log.error("   HF error: %s", info["error"])
@@ -510,7 +546,19 @@ class HfReader:
     async def _load_chunk(self, start: int) -> list:
         if start in self.chunks:
             return self.chunks[start]
-        data = await self.fetch(start, HF_MAX)
+        try:
+            data = await self.fetch(start, HF_MAX)
+        except Exception as exc:
+            # HF_SKIP_ON_FAIL=1 -> is page (100 records) ko chhod kar aage badho.
+            # Messages lagatar rahenge (channel me koi gap nahi dikhega), bas ye
+            # 100 records miss honge. Skip list state me save hoti hai.
+            if not HF_SKIP_ON_FAIL:
+                raise
+            self.skipped.append({"page": start, "rows": HF_MAX, "error": str(exc)[:160]})
+            log.warning("⏭️  HF page %s-%s SKIP (error: %s) — agle page se aage",
+                        start, start + HF_MAX - 1, str(exc)[:100])
+            self.chunks[start] = []
+            return []
         self.total = int(data.get("num_rows_total") or self.total or 0)
         records = []
         for i, item in enumerate(data.get("rows", []) or []):
@@ -993,8 +1041,13 @@ def progress_text(state: dict, elapsed: float, speed: float) -> str:
         f"⏳ Baaki: {remaining if remaining is not None else '?'}",
         f"⚡ Speed: {speed:.1f} rec/s · {speed * 60:.0f} rec/min · ⏱ {elapsed / 60:.1f} min",
         tail,
-        f"🔧 {MODE} · {BATCH_MODE} batch(max {BATCH_SIZE}) · in-flight {CONCURRENCY} · delay {DELAY}s",
+        f"🔧 {MODE} · {BATCH_MODE} batch(max {BATCH_SIZE}) · "
+        f"{'SEQUENCE' if SEQUENCE else f'in-flight {CONCURRENCY}'} · delay {DELAY}s",
     ] + (
+        [f"⏭️ HF skip: {state['skipped_records']} records "
+         f"({len(state.get('skipped_pages') or [])} page) — baaki sab bheja gaya"]
+        if state.get("skipped_records") else []
+    ) + (
         [f"👥 Accounts: {STATS_HOLDER['pool'].stats()}"]
         + ([f"⏳ Flood: {' '.join(STATS_HOLDER['pool'].flood_list())}"]
            if STATS_HOLDER["pool"].flood_list() else [])
@@ -1294,8 +1347,14 @@ async def run() -> None:
     #             13 accounts = 13 messages ek saath = 13x throughput.
     #             Commits strict order me hote hain, isliye record kabhi miss nahi hota.
     wave_span = max(1, BURST * len(pool))
-    log.info("⚡ SPEED MODE: %s accounts x BURST %s · dispatch depth %s msg · per-account lane 1 (order safe)",
-             len(pool), BURST, CONCURRENCY)
+    if SEQUENCE:
+        log.info("🔒 SEQUENCE MODE: ek waqt me 1 message — posts 100%% order me "
+                 "(~0.5s/msg × ~17 records = ~1500-2000 records/min). "
+                 "Fast chahiye to SEQUENCE=0")
+    else:
+        log.info("⚡ SPEED MODE: %s accounts x BURST %s · dispatch depth %s msg "
+                 "(thoda reordering ho sakta hai — SEQUENCE=1 se guaranteed order)",
+                 len(pool), BURST, CONCURRENCY)
 
     try:
         await reader.probe()                       # HF diagnostic (Render logs me kaam ka)
@@ -1316,38 +1375,69 @@ async def run() -> None:
     # ------------------------------------------------------------------
     pending: collections.deque = collections.deque()   # [(task, offset, count)]
     committed_upto = int(state["offset"])
-    ahead_limit = max(CONCURRENCY, wave_span * 2)      # kitne msg aage tak dispatch
+    ahead_limit = 1 if SEQUENCE else max(CONCURRENCY, wave_span * 2)
 
-    read_fails = [0]
+    def skipped_page_at(offset: int):
+        """Agar ye offset kisi skipped HF page me hai to (page_start, page_end) do."""
+        for item in reader.skipped:
+            page = int(item.get("page") or 0)
+            if page <= offset < page + int(item.get("rows") or HF_MAX):
+                return page, page + int(item.get("rows") or HF_MAX)
+        return None
 
-    async def dispatch_one(offset: int) -> bool:
-        """Ek message banao + bhejo.
-        True = aage badho | False = dataset sach me khatam.
-        HF par lagatar 3 fail = exception (chup-chaap 'finished' NAHI)."""
-        if END_OFFSET and offset >= END_OFFSET:
-            return False
-        for attempt in range(1, 4):
+    async def build_message(offset: int):
+        """offset se ek message banao. None = aage data nahi (dataset khatam).
+
+        ★ SKIP NAHI, RETRY: HF fail ho to yahin ruk kar koshish karta rehta hai.
+          Dataset ka ek bhi record miss nahi hota; progress ruki rehti hai,
+          aur jab HF theek ho jata hai, wahin se aage badh jata hai.
+        """
+        attempt = 0
+        while True:
+            attempt += 1
             try:
                 items = await collect_items(offset)
-                read_fails[0] = 0
+                if attempt > 1:
+                    log.info("✅ HF offset %s theek ho gaya (%s koshish) — aage badh rahe hain",
+                             offset, attempt)
                 break
+            except asyncio.CancelledError:
+                raise
             except Exception as exc:
                 msg = str(exc) or exc.__class__.__name__
-                state["last_error"] = msg[:300]
+                state["last_error"] = f"HF retry (offset {offset}): {msg}"[:300]
                 save_state(state)
-                if attempt >= 3:
-                    raise RuntimeError(
-                        f"HF se data nahi aa raha (3 koshish fail): {msg}"
-                    ) from exc
-                wait = 5 * attempt
-                log.error("HF read fail (%s/%s): %s -> %ss baad retry", attempt, 3, msg[:200], wait)
-                await asyncio.sleep(wait)
-        else:
-            return True
+                if not HF_RETRY_FOREVER and attempt >= HF_MAX_ATTEMPTS:
+                    raise RuntimeError(f"HF se data nahi aa raha: {msg}") from exc
+                pause = min(60, 3 * (2 ** min(attempt - 1, 4)))
+                log.warning("⚠️  HF read fail (offset %s, koshish %s): %s -> %ss baad RETRY "
+                            "(skip nahi kar rahe)", offset, attempt, msg[:120], pause)
+                await asyncio.sleep(pause)
         if not items:
+            return None
+        text, caption, file, count = build_batch(items, int(state["total"]))
+        return text, caption, file, count
+
+    async def dispatch_one(offset: int) -> bool:
+        """Ek message banao + queue me daalo. False = dataset khatam."""
+        if END_OFFSET and offset >= END_OFFSET:
+            return False
+        skip = skipped_page_at(offset)
+        if skip:
+            page, page_end = skip
+            count = page_end - offset
+            # Skip hue records ko "already done" entry ki tarah queue me daalo:
+            # offset contiguous rehta hai, channel me koi gap nahi dikhta.
+            pending.append((None, offset, count))
+            state.setdefault("skipped", [])
+            log.warning("⏭️  offset %s–%s SKIP (HF page %s fail hua tha) — agle records se aage",
+                        offset, page_end - 1, page)
+            return True
+        built = await build_message(offset)
+        if built is None:
             log.info("📭 Dataset khatam (offset=%s, total=%s)", offset, state["total"])
             return False
-        text, caption, file, count = build_batch(items, int(state["total"]))
+        text, caption, file, count = built
         task = asyncio.create_task(send_one(text, file, caption, pool.assign()))
         pending.append((task, offset, count))
         return True
@@ -1356,11 +1446,21 @@ async def run() -> None:
     planned = committed_upto
     try:
         while not stop.is_set() and not state.get("finished"):
-            # ---- 1) dispatch: depth bharo (slots strict order me assign hote hain) ----
-            while len(pending) < ahead_limit and (planned - committed_upto) < ahead_limit * BATCH_SIZE:
-                if not await dispatch_one(planned):
-                    break
-                planned += pending[-1][2]
+            # ---- 1) dispatch ----
+            if SEQUENCE:
+                # GUARANTEED ORDER: ek waqt me sirf EK message in-flight.
+                # Message 2 tabhi banega jab message 1 channel me pahunch chuka ho,
+                # isliye Telegram me posts 100% sequence wise dikhte hain.
+                if not pending:
+                    if not await dispatch_one(planned):
+                        break
+                    planned += pending[-1][2]
+            else:
+                while len(pending) < ahead_limit and (planned - committed_upto) < ahead_limit * BATCH_SIZE:
+                    if not await dispatch_one(planned):
+                        break
+                    planned += pending[-1][2]
+
             # ---- kuch pending nahi = aage data hi nahi mila ----
             if not pending:
                 total_now = int(state["total"] or 0)
@@ -1370,7 +1470,6 @@ async def run() -> None:
                     state["finished"] = True
                     log.info("🎉 Dataset khatam: %s/%s", committed_upto, total_now)
                 else:
-                    # yahan aana matlab dispatch ne items nahi diye — ye normal end nahi hai
                     state["last_error"] = (
                         f"data ruk gaya offset={committed_upto} total={total_now or '?'} "
                         f"(HF config/split ya rate-limit check karo)"
@@ -1378,16 +1477,20 @@ async def run() -> None:
                     save_state(state)
                     log.error("❌ %s", state["last_error"])
                 break
+
             # ---- 2) sabse purane message ka intezaar, phir commit ----
             task, off, cnt = pending[0]
-            try:
-                await task
-            except Exception as exc:
-                failure = exc
-                break
+            if task is not None:
+                try:
+                    await task
+                except Exception as exc:
+                    failure = exc
+                    break
             pending.popleft()
             commit(off, cnt)
             committed_upto = int(state["offset"])
+            state["skipped_pages"] = reader.skipped[-20:]
+            state["skipped_records"] = sum(int(x.get("rows") or 0) for x in reader.skipped)
             if saved >= STATE_SAVE_EVERY:
                 save_state(state)
                 saved = 0
@@ -1398,12 +1501,16 @@ async def run() -> None:
         # ---- baaki pending flush (order me) ----
         while pending and not failure:
             task, off, cnt = pending.popleft()
-            try:
-                await task
-            except Exception as exc:
-                failure = exc
-                break
+            if task is not None:
+                try:
+                    await task
+                except Exception as exc:
+                    failure = exc
+                    break
             commit(off, cnt)
+
+        if state["total"] and int(state["offset"]) >= int(state["total"]):
+            state["finished"] = True
 
         if failure:
             state["last_error"] = str(failure)
@@ -1484,6 +1591,8 @@ def status_snapshot() -> dict:
         "remaining": remaining,
         "percent": round((offset / total * 100), 2) if total else 0.0,
         "finished": bool(data.get("finished")),
+        "skipped_records": int(data.get("skipped_records") or 0),
+        "skipped_pages": data.get("skipped_pages") or [],
         "elapsed_sec": int(elapsed),
         "speed_rec_per_sec": round(speed, 2),
         "eta_sec": int(remaining / speed) if (speed and remaining) else None,
