@@ -125,6 +125,21 @@ MSG_CHARS = max(600, min(4000, env_int("MSG_CHARS", 3800)))
 # itna bada record message me trim karke nahi bhejte -> .json file (data safe)
 MAX_TRIM = max(4, env_int("MAX_TRIM_KB", 8)) * 1024
 
+# ---- SPEED KNOBS (v8) ------------------------------------------------------
+# KITNE MESSAGES ek hi account ko back-to-back bhejne se pehle next account?
+#   1  = strict alternate (msg1->acc1, msg2->acc2 ...) — sabse slow
+#   16 = burst mode: ek account 16 msg lagatar bhejta hai, phir agla.
+#        Pattern phir bhi 1->2->3 hai, bas lehar (wave) chhoti nahi hoti.
+#        Telegram ke per-bot ~20 msg/min limit se safely neeche rehta hai.
+BURST = max(1, env_int("BURST", 1))
+HF_PREFETCH = max(0, env_int("HF_PREFETCH", 6))     # aage ke kitne 100-row chunks pehle se
+HF_PAGE = 100                                       # HF /rows max
+# Bot API ka asli limit ~20 msg/min per bot. Isse upar jaate hi 429 (retry_after
+# 1000s+ = 18 min barbaad). Sliding-window limiter limit ke NEECHE rakhta hai
+# -> koi time waste nahi, throughput predictable. 0 = off.
+RATE_PER_MIN = env_int("RATE_PER_MIN", 18)
+DRY_LATENCY = env_float("DRY_RUN_LATENCY", 0.35)   # DRY_RUN me nakli send latency (benchmark)
+
 PROGRESS_EVERY = env_float("PROGRESS_EVERY", 10.0)
 STATE_SAVE_EVERY = env_int("STATE_SAVE_EVERY", 10)
 START_OFFSET = env_int("START_OFFSET", 0)
@@ -147,9 +162,61 @@ def _split_list(raw: str) -> list:
     return items
 
 
+def _classic_pairs() -> list:
+    """
+    Sabse common setup:
+        API_ID=11        API_HASH=h1        BOT_TOKEN=111:AAA
+        API_ID_2=22      API_HASH_2=h2      BOT_TOKEN_2=222:BBB
+        ... _3, _4, _5 ...
+    Har bot token apne hi api_id/hash ke saath pair hota hai (session = api_id+hash+token).
+    Ye alag-alag cross-product nahi banata, isliye 13 accounts jaisa gadbad nahi hota.
+    """
+    import re as _re
+
+    def group(regex_getter):
+        found = {}
+        for name, value in os.environ.items():
+            if not value or not value.strip():
+                continue
+            match = _re.fullmatch(regex_getter, name)
+            if not match:
+                continue
+            suffix = match.group(1) or "1"
+            try:
+                idx = int(suffix)
+            except ValueError:
+                idx = 1
+            found[idx] = value.strip()
+        return found
+
+    ids = group(r"(?:API_ID|TG_API_ID)(?:_(\d+))?")
+    hashes = group(r"(?:API_HASH|TG_API_HASH)(?:_(\d+))?")
+    tokens = group(r"(?:BOT_TOKEN|TG_BOT_TOKEN)(?:_(\d+))?")
+
+    # purane single naam (suffix nahi) ko index 1 maano
+    pool = []
+    for idx in sorted(set(list(ids) + list(hashes) + list(tokens))):
+        api_id = ids.get(idx, 0)
+        api_hash = hashes.get(idx, "")
+        token = tokens.get(idx, "")
+        try:
+            api_id = int(api_id)
+        except (TypeError, ValueError):
+            api_id = 0
+        if not token and not (api_id and api_hash):
+            continue
+        pool.append({"api_id": api_id, "api_hash": api_hash, "bot_token": token})
+    return pool
+
+
 def parse_pool() -> list:
     """Har account: {api_id, api_hash, bot_token}. Sab valid combos return karta hai."""
     pool = []
+
+    # (0) classic pairing: API_ID_n / API_HASH_n / BOT_TOKEN_n  (same index)
+    classic = _classic_pairs()
+    if classic:
+        return classic
 
     # (a) ACCOUNTS="api_id:api_hash:token"
     for entry in _split_list(env("ACCOUNTS")):
@@ -186,8 +253,9 @@ def parse_pool() -> list:
                 api_id = int(ids[i])
             except ValueError:
                 api_id = 0
+        # strict index pairing: token/ hash sirf apne index se
         api_hash = hashes[i] if i < len(hashes) else ""
-        token = tokens[i] if i < len(tokens) else (tokens[0] if tokens else "")
+        token = tokens[i] if i < len(tokens) else ""
         if api_id and api_hash:
             pool.append({"api_id": api_id, "api_hash": api_hash, "bot_token": token})
         elif token:
@@ -196,7 +264,36 @@ def parse_pool() -> list:
     return pool
 
 
+def dedupe_pool(pool: list) -> list:
+    """
+    SAME bot token ya SAME api_id+hash ko do jagah use karna = ek hi Telegram session
+    do parallel senders me -> "Request was unsuccessful 6 time(s)" errors.
+    Isliye duplicate hata dete hain (aur warn karte hain).
+    """
+    seen, out = set(), []
+    for acc in pool:
+        key = (acc["bot_token"] or "", acc["api_id"], acc["api_hash"] or "")
+        token_key = acc["bot_token"] or ""
+        if token_key and any(token_key == a["bot_token"] for a in out):
+            log.warning("⚠️ duplicate BOT token mila — skip (wahi session parallel nahi chal sakta)")
+            continue
+        if not token_key and acc["api_id"] and any(
+                a["api_id"] == acc["api_id"] and a["api_hash"] == acc["api_hash"] and not a["bot_token"]
+                for a in out):
+            log.warning("⚠️ duplicate api_id/api_hash mila (bina bot token) — skip")
+            continue
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(acc)
+    return out
+
+
 POOL = parse_pool()
+
+# duplicate accounts (same token / same session) hata do
+_REDIRECT = []  # token -> [api_id, api_hash] (user mode me token aur id alag ho)
+POOL = dedupe_pool(POOL)
 
 # MODE=auto -> agar kisi account me api_id/hash hai to MTProto (fast), warna bot
 if MODE_RAW == "auto":
@@ -223,7 +320,7 @@ else:
 DELAY = max(0.0, DELAY)
 ACCOUNTS_N = max(1, len(POOL))
 # total in-flight messages = accounts x per-account (max 32)
-CONCURRENCY = max(1, min(32, PER_ACCOUNT * ACCOUNTS_N))
+CONCURRENCY = max(1, min(512, PER_ACCOUNT * ACCOUNTS_N))
 
 
 
@@ -361,16 +458,19 @@ class HfReader:
         return records
 
     def prefetch(self, offset: int) -> None:
+        """v8 TRICK: aage ke HF_PREFETCH chunks EK SAATH (parallel) maango.
+        Pehle ek-ek karke aata tha (6 x 0.2s = 1.2s stall). Ab ~0.25s me 600 rows."""
         start = offset - (offset % HF_MAX)
-        nxt = start + HF_MAX
-        if self.total and nxt >= self.total:
-            return
-        if nxt in self.chunks:
-            return
-        task = self._prefetch.get(nxt)
-        if task and not task.done():
-            return
-        self._prefetch[nxt] = asyncio.create_task(self._safe_load(nxt))
+        for step in range(1, HF_PREFETCH + 1):
+            nxt = start + HF_MAX * step
+            if self.total and nxt >= self.total:
+                break
+            if nxt in self.chunks:
+                continue
+            task = self._prefetch.get(nxt)
+            if task and not task.done():
+                continue
+            self._prefetch[nxt] = asyncio.create_task(self._safe_load(nxt))
 
     async def _safe_load(self, start: int) -> None:
         try:
@@ -535,15 +635,29 @@ class SendGate:
         self.label = label
         self.pause_until = 0.0
         self.lock = asyncio.Lock()
+        # v8: ek hi account ke messages EK SAATH nahi jate (order + 429 safety),
+        # par har account apni alag "lane" me chalta hai -> 13 accounts = 13 parallel lanes
+        self.lane = asyncio.Semaphore(1)   # size AccountPool set karta hai
         self.sent = 0
         self.errors = 0
+        self.hits = collections.deque()    # rate limiter: pichle 60s ke send timestamps
 
     async def wait(self):
         while True:
             left = self.pause_until - time.monotonic()
             if left <= 0:
-                return
+                break
             await asyncio.sleep(min(left, 5.0))
+        if not RATE_PER_MIN:
+            return
+        while True:                       # sliding 60s window
+            now = time.monotonic()
+            while self.hits and now - self.hits[0] > 60.0:
+                self.hits.popleft()
+            if len(self.hits) < RATE_PER_MIN:
+                self.hits.append(now)
+                return
+            await asyncio.sleep(max(0.05, 60.0 - (now - self.hits[0])))
 
     async def pause(self, seconds: int):
         async with self.lock:
@@ -559,6 +673,9 @@ class AccountPool:
     7 -> acc1 (phir se). Har record ka account pehle se tay hota hai (deterministic),
     isliye koi record miss/mismatch nahi hota.
 
+    v8: har account ki apni "lane" (PER_ACCOUNT_CONCURRENCY msg parallel) hai —
+    isliye 13 accounts ek saath chalte hain aur pattern bhi 1->2->...->13->1 rehta hai.
+
     Agar kisi account ka flood-wait chal raha ho:
       • WAIT_FOR_ACCOUNT=1 (default) -> usi ka number ban raha hai to uska wait hoga
         (order aur alternation dono intact, dhakka-mukki nahi)
@@ -567,7 +684,12 @@ class AccountPool:
 
     def __init__(self, accounts: list, wait_for_account: bool = True):
         self.accounts = accounts                     # [(label, sender)]
-        self.gates = {label: SendGate(label) for label, _ in accounts}
+        per = max(1, env_int("PER_ACCOUNT_CONCURRENCY", 4))
+        self.gates = {}
+        for label, _ in accounts:
+            gate = SendGate(label)
+            gate.lane = asyncio.Semaphore(per)      # ek account X msg parallel (order server par)
+            self.gates[label] = gate
         self.senders = {label: sender for label, sender in accounts}
         self.wait_for_account = wait_for_account
         self._assignment = 0                         # record-message number (0-based)
@@ -579,6 +701,11 @@ class AccountPool:
     @property
     def labels(self) -> list:
         return [label for label, _ in self.accounts]
+
+    def live_labels(self, horizon: int = 0) -> list:
+        """Flood-wait me nahi hain aise accounts (agla wave inhi ko bhejega)."""
+        now = time.monotonic()
+        return [l for l, _ in self.accounts if self.gates[l].pause_until <= now]
 
     def assign(self):
         """Strict number-wise account (no await -> order safe)."""
@@ -684,7 +811,19 @@ class MtprotoAccount:
         from telethon import TelegramClient
         from telethon.sessions import StringSession
 
-        self.client = TelegramClient(StringSession(), api_id, api_hash)
+        # receive_updates=False -> GetChannelDifference/update loop band
+        #   (PersistentTimestampOutdatedError aana band ho jata hai)
+        # request_retries=1 -> "Request was unsuccessful 6 time(s)" ki jagah asli error
+        self.client = TelegramClient(
+            StringSession(), api_id, api_hash,
+            receive_updates=False,
+            request_retries=1,
+            connection_retries=5,
+            retry_delay=2,
+            timeout=30,
+            flood_sleep_threshold=60,
+            auto_reconnect=True,
+        )
         self.bot_token = bot_token
         self.channel = channel
         self.admin = admin
@@ -696,8 +835,14 @@ class MtprotoAccount:
         else:
             await self.client.start()
         me = await self.client.get_me()
-        log.info("%s connected as @%s (id %s)", self.label,
-                 getattr(me, "username", None), me.id)
+        # channel/peer pehle resolve karo -> send me "Could not find the input entity" nahi aayega
+        try:
+            peer = await self.client.get_input_entity(self.channel)
+            log.info("%s connected as @%s (id %s) · channel resolve ✓",
+                     self.label, getattr(me, "username", None), me.id)
+        except Exception as exc:
+            log.warning("%s: channel resolve fail (%s) — check karo bot channel me admin hai",
+                        self.label, exc)
 
     async def _send(self, chat, text=None, file=None):
         from telethon.errors import FloodWaitError, SlowModeWaitError
@@ -712,7 +857,12 @@ class MtprotoAccount:
                     attributes=[DocumentAttributeFilename(file[0])],
                 )
             else:
-                await self.client.send_message(chat, text, link_preview=False, parse_mode="html")
+                await asyncio.wait_for(
+                    self.client.send_message(chat, text, link_preview=False, parse_mode="html"),
+                    timeout=60,
+                )
+        except asyncio.TimeoutError:
+            raise RuntimeError("send timeout (60s) — network/DC issue")
         except (FloodWaitError, SlowModeWaitError) as exc:
             raise FloodWait(getattr(exc, "seconds", 30), str(exc))
 
@@ -785,13 +935,18 @@ async def run() -> None:
             log.error("❌ %s", item)
         return
 
+    global STOP_EVENT, CONCURRENCY
+
     channel = as_chat_id(CHANNEL_ID)
     admin = as_chat_id(ADMIN_ID) if ADMIN_ID else None
 
     log.info("MODE=%s | accounts=%s | batch=%s(max %s, %s chars) | in-flight=%s | delay=%ss",
              MODE, len(POOL), BATCH_MODE, BATCH_SIZE, MSG_CHARS, CONCURRENCY, DELAY)
+    if MODE == "bot":
+        log.info("ℹ️  MODE=bot → api_id/api_hash Telegram ko NAHI jaate (Bot API me unki "
+                 "zaroorat hi nahi). Sirf 13 bot tokens speed/limit decide karte hain. "
+                 "MTProto (api_id/api_hash) chahiye to MODE=user karo.")
 
-    global STOP_EVENT
     if STOP_EVENT is None:
         STOP_EVENT = asyncio.Event()
     stop = STOP_EVENT
@@ -815,42 +970,73 @@ async def run() -> None:
         label = f"acc{idx}"
         api_id, api_hash, token = acc["api_id"], acc["api_hash"], acc["bot_token"]
 
+        if MODE == "user" and api_id and api_hash and not token:
+            log.warning("%s skip — api_id/hash to hai par BOT_TOKEN nahi "
+                        "(MTProto login ke liye bot token chahiye; ya MODE=bot karo)", label)
+            continue
         if MODE == "user" and api_id and api_hash:
             if token and idx > 1 and LOGIN_STAGGER > 0:
                 await asyncio.sleep(LOGIN_STAGGER)     # ek saath login na karein
             acc_obj = MtprotoAccount(api_id, api_hash, token, channel, admin, label=label)
-            await acc_obj.start()
+            try:
+                await acc_obj.start()
+            except Exception as exc:
+                msg = str(exc) or exc.__class__.__name__
+                log.error("❌ %s login FAIL: %s", label, msg[:200])
+                if any(k in msg.lower() for k in ("api_id", "api_hash", "unauthorized", "token")):
+                    log.error("   → api_id/api_hash/token galat lag raha hai (ye account skip)")
+                elif any(k in msg.lower() for k in ("auth_key", "session", "revoked")):
+                    log.error("   → session problem: bot token dobara check karo / naya token lo")
+                elif any(k in msg.lower() for k in ("connect", "timeout", "network")):
+                    log.error("   → network issue: Render outbound blocked / DC reachable nahi")
+                JOB["last_error"] = f"{label}: {msg[:160]}"
+                continue          # baaki accounts chalte rahenge
             accounts.append((label, acc_obj))
         elif token:
             if http_client is None:
-                http_client = httpx.AsyncClient(timeout=60.0)
+                http_client = httpx.AsyncClient(
+                    timeout=60.0,
+                    limits=httpx.Limits(max_connections=64, max_keepalive_connections=32,
+                                        keepalive_expiry=300.0),
+                    http2=False,
+                )
             accounts.append((label, BotAccount(token, channel, admin, label=label)))
         else:
             log.warning("%s skip — api_id/api_hash ya bot_token missing", label)
 
     if not accounts:
-        log.error("❌ koi valid account nahi mila (BOT_TOKEN / API_ID+API_HASH check karo)")
+        JOB["last_error"] = "koi account login nahi ho paya (BOT_TOKEN/API_ID/API_HASH check karo)"
+        log.error("❌ koi valid account nahi mila — Render env me BOT_TOKEN / API_ID+API_HASH check karo. "
+                  "Web service phir bhi chalu rahegi (/health, /status).")
         return
 
     pool = AccountPool(accounts, wait_for_account=WAIT_FOR_ACCOUNT)
     STATS_HOLDER["pool"] = pool
+
+    # actual in-flight = per-account × valid accounts (skip hue accounts count na hon)
+    CONCURRENCY = max(1, min(512, PER_ACCOUNT * len(pool)))
+    pattern = (" → ".join(pool.labels + [pool.labels[0]]) if len(pool) > 1 else pool.labels[0])
     log.info("ACCOUNTS: %s (total %s, in-flight %s) | pattern: %s | flood par: %s",
-             ", ".join(pool.labels), len(pool), CONCURRENCY,
-             " → ".join(pool.labels + [pool.labels[0]]),
+             ", ".join(pool.labels), len(pool), CONCURRENCY, pattern,
              "wait (order safe)" if WAIT_FOR_ACCOUNT else "agla free account")
 
     async def raw_send(label, text, file=None, caption=None):
         if DRY_RUN:
-            log.info("[DRY_RUN][%s] would send: %s", label, text.split("\n")[0])
-            await asyncio.sleep(0.05)
+            # DRY_RUN me bhi realistic timing (0.35s/msg) taaki speed naap sako
+            await asyncio.sleep(DRY_LATENCY)
             return
         sender = pool.senders[label]
-        if isinstance(sender, MtprotoAccount):
-            await sender.send_record(text, file)
-        else:
-            await sender.send_record(http_client, text, file, caption)
+        gate = pool.gates[label]
+        async with gate.lane:                 # ek account ke msg order me, par dusre accounts parallel
+            if isinstance(sender, MtprotoAccount):
+                await sender.send_record(text, file)
+            else:
+                await sender.send_record(http_client, text, file, caption)
 
     async def send_admin(text):
+        if DRY_RUN:
+            log.info("[DRY_RUN admin] %s", text.split("\n")[0])
+            return
         label, sender, gate, _idx = pool.assign_admin()
         try:
             if isinstance(sender, MtprotoAccount):
@@ -878,7 +1064,15 @@ async def run() -> None:
             label, sender, gate, idx = slot
 
         attempts = 0
+        flood_hits = 0
         while True:
+            # v8: agar is account ka flood-wait chal raha hai to bhejne se PEHLE hi
+            # agla zinda account le lo (3s/18min wait barbaad na ho). Record safe.
+            if gate.pause_until > time.monotonic() and len(pool) > 1:
+                alt = pool.free_account(idx)
+                if alt:
+                    log.debug("[%s] flood me hai -> pre-switch [%s]", label, alt[0][:0] or alt[0])
+                    label, sender, gate, idx = alt
             await gate.wait()
             try:
                 await raw_send(label, text, file, caption)
@@ -886,18 +1080,32 @@ async def run() -> None:
                 return label
             except FloodWait as exc:
                 gate.errors += 1
+                flood_hits += 1
                 await gate.pause(exc.seconds)
-                if not pool.wait_for_account:
+                # v8: 3 flood/ya 5-min se lamba flood = ye account bekaar ho gaya.
+                # Us message ko zinda account par shift karo (record bachta hai,
+                # warna 18 min tak poora export ruka rehta tha).
+                want_switch = (not pool.wait_for_account) or flood_hits >= 3 or exc.seconds > 300
+                if want_switch:
                     alt = pool.free_account(idx)
                     if alt:
+                        old_label = label
                         label, sender, gate, idx = alt
-                        log.info("↪️ [%s] flood me hai -> [%s] se bhej raha hoon", 
-                                 pool.labels[idx], label)
+                        flood_hits = 0
+                        log.warning("↪️ [%s] flood (%ss) -> ye message [%s] se bhej raha hoon "
+                                    "(record safe, order safe)", old_label, exc.seconds, label)
+                    elif flood_hits > MAX_RETRIES * 4:
+                        raise RuntimeError(f"[{label}] flood-wait khatam nahi ho raha ({exc.seconds}s)")
             except Exception as exc:
                 gate.errors += 1
                 attempts += 1
+                msg = str(exc) or exc.__class__.__name__
+                if "unsuccessful" in msg or "timeout" in msg.lower():
+                    # network/DC issue -> us account ko 5s rest, dusra account try
+                    log.warning("[%s] connection issue (%s) -> account 5s rest", label, msg)
+                    gate.pause(5)
                 if attempts >= MAX_RETRIES * max(1, len(pool)):
-                    raise
+                    raise RuntimeError(f"[{label}] {msg}")
                 wait = min(15, 1.5 ** min(attempts, 5))
                 log.warning("[%s] send error (%s) -> %.1fs baad retry", label, exc, wait)
                 await asyncio.sleep(wait)
@@ -925,9 +1133,6 @@ async def run() -> None:
         except Exception as exc:
             log.warning("progress send fail: %s", exc)
 
-    window: collections.deque = collections.deque()     # in-flight send tasks
-    inflight: collections.deque = collections.deque()   # (start_offset, count)
-
     def commit(start_offset: int, count: int):
         nonlocal session_sent, session_msgs, saved
         state["offset"] = start_offset + count
@@ -937,94 +1142,109 @@ async def run() -> None:
         session_msgs += 1
         saved += 1
 
-    try:
-        try:
-            first_record, warm_total = await reader.get(int(state["offset"]))
-            if warm_total:
-                state["total"] = warm_total
-            if first_record is None and warm_total:
-                state["finished"] = True
-                log.info("Dataset khatam (offset %s / total %s)", state["offset"], warm_total)
-        except Exception as exc:
-            log.warning("warmup fail (%s) — chalta rahega", exc)
-
-        save_state(state)
-        await push_progress(force=True)
-        try:
-            await send_admin(
-                f"▶️ START\n🗂 {html_escape(HF_DATASET)} · {HF_CONFIG}/{HF_SPLIT}\n"
-                f"📍 resume offset: {started_offset}\n"
-                f"📦 batch: {BATCH_MODE} (max {BATCH_SIZE} records / {MSG_CHARS} chars per message)\n"
-                f"🔧 {MODE} · concurrency {CONCURRENCY} · delay {DELAY}s\n🕒 {now_iso()}"
-            )
-        except Exception:
-            pass
-
-        failure = None
-
-        while not stop.is_set() and not state.get("finished"):
-            assigned = sum(count for _, count in inflight)
-            start_offset = int(state["offset"]) + assigned
-
-            if END_OFFSET and start_offset >= END_OFFSET:
-                log.info("END_OFFSET (%s) -> ruk gaya", END_OFFSET)
-                break
-
-            # ---- records taiyar karo (max BATCH_SIZE) ----
-            items = []
-            for i in range(BATCH_SIZE):
-                try:
-                    record, total = await reader.get(start_offset + i)
-                except Exception as exc:
-                    state["last_error"] = str(exc)
-                    save_state(state)
-                    log.error("HF read fail: %s -> 20s retry", exc)
-                    await asyncio.sleep(20)
-                    break
-                if total:
-                    state["total"] = total
-                if record is None:
-                    break
-                items.append((start_offset + i, record))
-
-            if not items:
-                state["finished"] = True
-                break
-
-            text, caption, file, count = build_batch(items, int(state["total"]))
-            slot = pool.assign()          # strict: msg1->acc1, msg2->acc2, ...
-            window.append(asyncio.create_task(send_one(text, file, caption, slot)))
-            inflight.append((start_offset, count))
-
-            while len(window) >= CONCURRENCY:
-                try:
-                    await window.popleft()
-                except Exception as exc:
-                    failure = exc
-                    break
-                off, cnt = inflight.popleft()
-                commit(off, cnt)
-                if saved >= STATE_SAVE_EVERY:
-                    save_state(state)
-                    saved = 0
-                await push_progress()
-                if DELAY:
-                    await asyncio.sleep(DELAY)
-
-            if failure:
-                break
-            # NOTE: yahan 'ended' par break NAHI karte — agar batch partial tha
-            # (auto mode me kam records fit hue) to baaki records agle loop me jayenge.
-            # Data khatam hone par agli baar reader None dega -> finished.
-
-        while window:
+    async def collect_items(start_offset):
+        items = []
+        for i in range(BATCH_SIZE):
             try:
-                await window.popleft()
+                record, total = await reader.get(start_offset + i)
             except Exception as exc:
-                failure = failure or exc
-                inflight.popleft()
-                continue
-            off, cnt = inflight.popleft()
+                raise RuntimeError(f"HF read fail: {exc}") from exc
+            if total:
+                state["total"] = total
+            if record is None:
+                break
+            items.append((start_offset + i, record))
+        return items
+
+    # ================== WAVE ENGINE (v8 - asli speed yahin hai) ==================
+    # PEHLE (v7): har message ke baad "await window.popleft()" -> pipeline block.
+    #             Ek 0.5-5s wala send = baaki 12 accounts idle. 13 tokens hone par bhi slow.
+    # AB (v8):    ek "wave" = (live accounts x BURST) messages, sab PARALLEL dispatch,
+    #             har account ki apni lane (SendGate.lane) -> uske andar order safe.
+    #             13 accounts = 13 messages ek saath = 13x throughput.
+    #             Commits strict order me hote hain, isliye record kabhi miss nahi hota.
+    wave_span = max(1, BURST * len(pool))
+    log.info("⚡ SPEED MODE: %s accounts x BURST %s · dispatch depth %s msg · per-account lane 1 (order safe)",
+             len(pool), BURST, CONCURRENCY)
+
+    try:
+        await reader.get(int(state["offset"]))     # HF prefetch garam karo
+    except Exception:
+        pass
+
+    # ------------------------------------------------------------------
+    # v8 PIPELINE: dispatch bharta rehta hai, commit FIFO order me hota hai.
+    #  • Ek account flood-wait me chala jaye -> BAQI 12 accounts rukte NAHI
+    #    (pehle v7 me poora pipeline usi ek account par atka rehta tha = "slow 🦥")
+    #  • Commit sirf contiguous prefix (offset, offset+count, ...) par hota hai
+    #    -> record kabhi skip/mismatch nahi hota, state hamesha sahi.
+    # ------------------------------------------------------------------
+    pending: collections.deque = collections.deque()   # [(task, offset, count)]
+    committed_upto = int(state["offset"])
+    ahead_limit = max(CONCURRENCY, wave_span * 2)      # kitne msg aage tak dispatch
+
+    async def dispatch_one(offset: int) -> bool:
+        """Ek message banao + bhejo. False = dataset khatam."""
+        if END_OFFSET and offset >= END_OFFSET:
+            return False
+        try:
+            items = await collect_items(offset)
+        except Exception as exc:
+            state["last_error"] = str(exc)
+            save_state(state)
+            log.error("%s -> 20s baad retry", exc)
+            await asyncio.sleep(20)
+            return True                                 # retry
+        if not items:
+            return False
+        text, caption, file, count = build_batch(items, int(state["total"]))
+        task = asyncio.create_task(send_one(text, file, caption, pool.assign()))
+        pending.append((task, offset, count))
+        return True
+
+    failure = None
+    planned = committed_upto
+    try:
+        while not stop.is_set() and not state.get("finished"):
+            # ---- 1) dispatch: depth bharo (slots strict order me assign hote hain) ----
+            while len(pending) < ahead_limit and (planned - committed_upto) < ahead_limit * BATCH_SIZE:
+                if not await dispatch_one(planned):
+                    break
+                planned += pending[-1][2]
+            # ---- agar kuch bhi pending nahi aur aage data nahi -> khatam ----
+            if not pending:
+                if int(state["total"]) and committed_upto >= int(state["total"]):
+                    state["finished"] = True
+                elif planned >= (END_OFFSET or 0) > 0:
+                    break
+                else:
+                    state["finished"] = True
+                break
+            # ---- 2) sabse purane message ka intezaar, phir commit ----
+            task, off, cnt = pending[0]
+            try:
+                await task
+            except Exception as exc:
+                failure = exc
+                break
+            pending.popleft()
+            commit(off, cnt)
+            committed_upto = int(state["offset"])
+            if saved >= STATE_SAVE_EVERY:
+                save_state(state)
+                saved = 0
+            await push_progress()
+            if DELAY:
+                await asyncio.sleep(DELAY)
+
+        # ---- baaki pending flush (order me) ----
+        while pending and not failure:
+            task, off, cnt = pending.popleft()
+            try:
+                await task
+            except Exception as exc:
+                failure = exc
+                break
             commit(off, cnt)
 
         if failure:
@@ -1346,9 +1566,10 @@ async def supervise() -> None:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            JOB["last_error"] = str(exc)
-            log.exception("run() crash: %s -> 15s baad resume", exc)
-            await asyncio.sleep(15)
+            msg = str(exc) or exc.__class__.__name__
+            JOB["last_error"] = msg[:200]
+            log.error("run() ruk gaya: %s -> 60s baad dobara koshish", msg[:200])
+            await asyncio.sleep(60)
             continue
         finally:
             JOB["stopped_at"] = now_iso()
