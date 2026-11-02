@@ -132,7 +132,10 @@ MAX_TRIM = max(4, env_int("MAX_TRIM_KB", 8)) * 1024
 #        Pattern phir bhi 1->2->3 hai, bas lehar (wave) chhoti nahi hoti.
 #        Telegram ke per-bot ~20 msg/min limit se safely neeche rehta hai.
 BURST = max(1, env_int("BURST", 1))
-HF_PREFETCH = max(0, env_int("HF_PREFETCH", 6))     # aage ke kitne 100-row chunks pehle se
+HF_PREFETCH = max(0, env_int("HF_PREFETCH", 3))     # aage ke kitne 100-row chunks pehle se
+# HF datasets-server bhi rate-limit karta hai (bina token ~1 req/sec). Bahut parallel
+# prefetch = 429 = "evaluate ok but 0 rows" jaisa behaviour. Ye throttle usse rokta hai.
+HF_MIN_INTERVAL = env_float("HF_MIN_INTERVAL", 0.3)  # do HF requests ke beech min gap (sec)
 HF_PAGE = 100                                       # HF /rows max
 # Bot API ka asli limit ~20 msg/min per bot. Isse upar jaate hi 429 (retry_after
 # 1000s+ = 18 min barbaad). Sliding-window limiter limit ke NEECHE rakhta hai
@@ -400,6 +403,10 @@ def hf_headers() -> dict:
     return headers
 
 
+class HfProblem(RuntimeError):
+    """HF ne kuch ajeeb bheja (empty page / galat config) — dataset khatam NAHI hai."""
+
+
 class HfReader:
     """100-row chunk + background prefetch (fetch kabhi bhi bottleneck nahi)."""
 
@@ -408,11 +415,26 @@ class HfReader:
         self.total = 0
         self.chunks: dict = {}
         self._prefetch: dict = {}
+        self._last_req = 0.0
+        self._throttle_lock = asyncio.Lock()
+        self.hf_429 = 0
+
+    async def _throttle(self) -> None:
+        """HF requests ko serial pace karo (429 se bachne ke liye)."""
+        if HF_MIN_INTERVAL <= 0:
+            return
+        async with self._throttle_lock:
+            now = time.monotonic()
+            wait = HF_MIN_INTERVAL - (now - self._last_req)
+            if wait > 0:
+                await asyncio.sleep(wait)
+            self._last_req = time.monotonic()
 
     async def fetch(self, offset: int, length: int) -> dict:
         last_error = ""
         for attempt in range(1, MAX_RETRIES + 1):
             try:
+                await self._throttle()
                 response = await self.client.get(
                     f"{HF_API}/rows",
                     params={
@@ -425,8 +447,11 @@ class HfReader:
                     timeout=45.0,
                 )
                 if response.status_code == 429:
-                    await asyncio.sleep(min(30, 3 * attempt))
-                    last_error = "HTTP 429"
+                    self.hf_429 += 1
+                    pause = min(60, 5 * (2 ** (attempt - 1)))
+                    log.warning("⏳ HF 429 (rate limit) -> %ss ruk raha hoon", pause)
+                    await asyncio.sleep(pause)
+                    last_error = "HTTP 429 (HF rate limit)"
                     continue
                 if response.status_code >= 400:
                     last_error = f"HTTP {response.status_code}"
@@ -443,6 +468,45 @@ class HfReader:
                 await asyncio.sleep(min(20, 2 * attempt))
         raise RuntimeError(f"HF rows fetch failed: {last_error}")
 
+    async def probe(self) -> dict:
+        """Startup diagnostic: HF ko wahi sawaal, saaf jawab log me.
+        (Render par dataset/config galat ho to YAHIN pata chal jayega.)"""
+        info = {"url": "", "status": 0, "rows": 0, "total": 0, "features": [], "error": ""}
+        try:
+            response = await self.client.get(
+                f"{HF_API}/rows",
+                params={"dataset": HF_DATASET, "config": HF_CONFIG, "split": HF_SPLIT,
+                        "offset": 0, "length": 5},
+                timeout=45.0,
+            )
+            info["url"] = str(response.request.url)
+            info["status"] = response.status_code
+            data = response.json() if response.content else {}
+            info["rows"] = len(data.get("rows") or [])
+            info["total"] = int(data.get("num_rows_total") or 0)
+            info["features"] = [f.get("name") for f in (data.get("features") or [])][:12]
+            info["error"] = str(data.get("error") or "")
+        except Exception as exc:
+            info["error"] = f"{type(exc).__name__}: {exc}"[:200]
+
+        log.info("🔎 HF probe: %s/%s [%s] → HTTP %s · rows=%s · total=%s",
+                 HF_DATASET, HF_CONFIG, HF_SPLIT, info["status"], info["rows"], info["total"])
+        if info["features"]:
+            log.info("   columns: %s", ", ".join(map(str, info["features"])))
+        if info["status"] == 429:
+            log.warning("   ⏳ HF rate-limit (429) — ye aapke IP ka limit hai, config galat nahi. "
+                        "Exporter khud retry karta rahega.")
+            return info
+        if info["error"]:
+            log.error("   HF error: %s", info["error"])
+            log.error("   → HF_DATASET / HF_CONFIG / HF_SPLIT check karo. "
+                      "Config list: https://datasets-server.huggingface.co/splits?dataset=%s",
+                      HF_DATASET)
+        if info["status"] == 200 and info["rows"] == 0:
+            log.error("   ⚠️ 0 rows mile par total=%s — config/split galat lagta hai "
+                      "(khali page ko 'dataset khatam' nahi maanenge)", info["total"])
+        return info
+
     async def _load_chunk(self, start: int) -> list:
         if start in self.chunks:
             return self.chunks[start]
@@ -456,14 +520,28 @@ class HfReader:
             record = clean(row)
             record["_index"] = item.get("row_idx", start + i) if isinstance(item, dict) else start + i
             records.append(record)
+        if not records:
+            if self.total and start >= self.total:
+                self.chunks[start] = []          # sach me dataset khatam (KeyError na aaye)
+                return []
+            # offset total se chhota hai -> data HONA chahiye. Khali page = HF/params problem.
+            raise HfProblem(
+                f"HF ne 0 rows diye (offset={start}, total={self.total or '?'}, "
+                f"dataset={HF_DATASET}, config={HF_CONFIG}, split={HF_SPLIT}) — "
+                f"config/split galat hai ya HF rate-limit. Dataset khatam NAHI hai."
+            )
         self.chunks[start] = records
         for key in [k for k in self.chunks if k < start - HF_MAX * 2]:
             self.chunks.pop(key, None)
         return records
 
     def prefetch(self, offset: int) -> None:
-        """v8 TRICK: aage ke HF_PREFETCH chunks EK SAATH (parallel) maango.
-        Pehle ek-ek karke aata tha (6 x 0.2s = 1.2s stall). Ab ~0.25s me 600 rows."""
+        """Aage ke HF_PREFETCH chunks background me (par serial pace, 429 se bachne ko).
+
+        v8.1: pehle 6 chunks EK SAATH maangte the -> HF datasets-server 429 deta hai,
+        aur 429 par kuch chunks khaali aate hain -> export chup-chaap "finished" ho jata tha.
+        Ab: sirf HF_PREFETCH (3) chunks, ek ke baad ek (HF_MIN_INTERVAL gap).
+        """
         start = offset - (offset % HF_MAX)
         for step in range(1, HF_PREFETCH + 1):
             nxt = start + HF_MAX * step
@@ -475,6 +553,7 @@ class HfReader:
             if task and not task.done():
                 continue
             self._prefetch[nxt] = asyncio.create_task(self._safe_load(nxt))
+            break                                    # ek waqt me ek hi prefetch
 
     async def _safe_load(self, start: int) -> None:
         try:
@@ -1219,9 +1298,14 @@ async def run() -> None:
              len(pool), BURST, CONCURRENCY)
 
     try:
+        await reader.probe()                       # HF diagnostic (Render logs me kaam ka)
+    except Exception as exc:
+        log.warning("HF probe fail: %s", exc)
+
+    try:
         await reader.get(int(state["offset"]))     # HF prefetch garam karo
-    except Exception:
-        pass
+    except Exception as exc:
+        log.warning("warmup fail: %s — loop khud retry karega", str(exc)[:200])
 
     # ------------------------------------------------------------------
     # v8 PIPELINE: dispatch bharta rehta hai, commit FIFO order me hota hai.
@@ -1234,19 +1318,34 @@ async def run() -> None:
     committed_upto = int(state["offset"])
     ahead_limit = max(CONCURRENCY, wave_span * 2)      # kitne msg aage tak dispatch
 
+    read_fails = [0]
+
     async def dispatch_one(offset: int) -> bool:
-        """Ek message banao + bhejo. False = dataset khatam."""
+        """Ek message banao + bhejo.
+        True = aage badho | False = dataset sach me khatam.
+        HF par lagatar 3 fail = exception (chup-chaap 'finished' NAHI)."""
         if END_OFFSET and offset >= END_OFFSET:
             return False
-        try:
-            items = await collect_items(offset)
-        except Exception as exc:
-            state["last_error"] = str(exc)
-            save_state(state)
-            log.error("%s -> 20s baad retry", exc)
-            await asyncio.sleep(20)
-            return True                                 # retry
+        for attempt in range(1, 4):
+            try:
+                items = await collect_items(offset)
+                read_fails[0] = 0
+                break
+            except Exception as exc:
+                msg = str(exc) or exc.__class__.__name__
+                state["last_error"] = msg[:300]
+                save_state(state)
+                if attempt >= 3:
+                    raise RuntimeError(
+                        f"HF se data nahi aa raha (3 koshish fail): {msg}"
+                    ) from exc
+                wait = 5 * attempt
+                log.error("HF read fail (%s/%s): %s -> %ss baad retry", attempt, 3, msg[:200], wait)
+                await asyncio.sleep(wait)
+        else:
+            return True
         if not items:
+            log.info("📭 Dataset khatam (offset=%s, total=%s)", offset, state["total"])
             return False
         text, caption, file, count = build_batch(items, int(state["total"]))
         task = asyncio.create_task(send_one(text, file, caption, pool.assign()))
@@ -1262,14 +1361,22 @@ async def run() -> None:
                 if not await dispatch_one(planned):
                     break
                 planned += pending[-1][2]
-            # ---- agar kuch bhi pending nahi aur aage data nahi -> khatam ----
+            # ---- kuch pending nahi = aage data hi nahi mila ----
             if not pending:
-                if int(state["total"]) and committed_upto >= int(state["total"]):
+                total_now = int(state["total"] or 0)
+                if END_OFFSET and committed_upto >= END_OFFSET:
+                    log.info("END_OFFSET (%s) poora ho gaya", END_OFFSET)
+                elif total_now and committed_upto >= total_now:
                     state["finished"] = True
-                elif planned >= (END_OFFSET or 0) > 0:
-                    break
+                    log.info("🎉 Dataset khatam: %s/%s", committed_upto, total_now)
                 else:
-                    state["finished"] = True
+                    # yahan aana matlab dispatch ne items nahi diye — ye normal end nahi hai
+                    state["last_error"] = (
+                        f"data ruk gaya offset={committed_upto} total={total_now or '?'} "
+                        f"(HF config/split ya rate-limit check karo)"
+                    )
+                    save_state(state)
+                    log.error("❌ %s", state["last_error"])
                 break
             # ---- 2) sabse purane message ka intezaar, phir commit ----
             task, off, cnt = pending[0]
