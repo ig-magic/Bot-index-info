@@ -137,7 +137,11 @@ HF_PAGE = 100                                       # HF /rows max
 # Bot API ka asli limit ~20 msg/min per bot. Isse upar jaate hi 429 (retry_after
 # 1000s+ = 18 min barbaad). Sliding-window limiter limit ke NEECHE rakhta hai
 # -> koi time waste nahi, throughput predictable. 0 = off.
-RATE_PER_MIN = env_int("RATE_PER_MIN", 18)
+RATE_PER_MIN = env_int("RATE_PER_MIN", 18)   # MODE=bot: 20/min per group ka safe margin
+# Official: "single chat me 1 msg/sec se zyada mat bhejo" — ye limit CHAT ki hai, bot ki nahi.
+# Saare accounts ek hi channel me bhejte hain -> poore export ka shared ceiling 60 msg/min.
+# Ye throttle ussi ko enforce karta hai (0 = off).
+CHAT_PER_SEC = env_float("CHAT_PER_SEC", 1.0)
 DRY_LATENCY = env_float("DRY_RUN_LATENCY", 0.35)   # DRY_RUN me nakli send latency (benchmark)
 
 PROGRESS_EVERY = env_float("PROGRESS_EVERY", 10.0)
@@ -944,8 +948,16 @@ async def run() -> None:
              MODE, len(POOL), BATCH_MODE, BATCH_SIZE, MSG_CHARS, CONCURRENCY, DELAY)
     if MODE == "bot":
         log.info("ℹ️  MODE=bot → api_id/api_hash Telegram ko NAHI jaate (Bot API me unki "
-                 "zaroorat hi nahi). Sirf 13 bot tokens speed/limit decide karte hain. "
-                 "MTProto (api_id/api_hash) chahiye to MODE=user karo.")
+                 "zaroorat hi nahi). Speed sirf unique bot tokens se aati hai. "
+                 "Per-bot limit: 1 msg/sec per chat, 20/min per group.")
+        if RATE_PER_MIN == 18:
+            log.info("   RATE_PER_MIN=18 (Bot API default). MTProto chahiye to MODE=user karo.")
+    else:
+        log.warning("⚠️  MODE=user → api_id/api_hash session banane ke liye use ho rahe hain "
+                    "(MTProto). Ye as a BOT login karta hai (bot token ke saath), "
+                    "isliye bot ke rights/limit hi rehte hain — sirf transport badalta hai.")
+        log.info("   MTProto + per-chat 1 msg/sec = shared channel par ~60 msg/min. "
+                 "Bot API (MODE=bot) me per-bot 20/min = 13 bots par ~260 msg/min.")
 
     if STOP_EVENT is None:
         STOP_EVENT = asyncio.Event()
@@ -966,33 +978,57 @@ async def run() -> None:
     accounts = []
     http_client = None
 
-    for idx, acc in enumerate(POOL, start=1):
-        label = f"acc{idx}"
+    async def login_mtproto(idx, acc, label):
+        """Ek MTProto account login (parallel chalta hai)."""
         api_id, api_hash, token = acc["api_id"], acc["api_hash"], acc["bot_token"]
-
-        if MODE == "user" and api_id and api_hash and not token:
-            log.warning("%s skip — api_id/hash to hai par BOT_TOKEN nahi "
-                        "(MTProto login ke liye bot token chahiye; ya MODE=bot karo)", label)
-            continue
-        if MODE == "user" and api_id and api_hash:
-            if token and idx > 1 and LOGIN_STAGGER > 0:
-                await asyncio.sleep(LOGIN_STAGGER)     # ek saath login na karein
-            acc_obj = MtprotoAccount(api_id, api_hash, token, channel, admin, label=label)
+        if not (api_id and api_hash):
+            log.warning("%s skip — api_id/api_hash missing", label)
+            return None
+        if not token:
+            log.warning("%s skip — BOT_TOKEN nahi (MTProto login ke liye bot token chahiye; "
+                        "ya MODE=bot karo)", label)
+            return None
+        acc_obj = MtprotoAccount(api_id, api_hash, token, channel, admin, label=label)
+        try:
+            await acc_obj.start()
+            return label, acc_obj
+        except Exception as exc:
+            msg = str(exc) or exc.__class__.__name__
+            log.error("❌ %s login FAIL: %s", label, msg[:200])
+            low = msg.lower()
+            if "api_id" in low or "api_hash" in low:
+                log.error("   → api_id/api_hash pair GALAT hai (my.telegram.org se dobara lo). "
+                          "Ye account skip, baaki chalenge.")
+            elif any(k in low for k in ("unauthorized", "token")):
+                log.error("   → bot token galat/revoked hai (BotFather se dobara lo)")
+            elif any(k in low for k in ("auth_key", "session", "revoked")):
+                log.error("   → session problem: naya string session / token check karo")
+            elif any(k in low for k in ("connect", "timeout", "network")):
+                log.error("   → network: Render ka outbound / DC reachable nahi")
+            JOB["last_error"] = f"{label}: {msg[:160]}"
             try:
-                await acc_obj.start()
-            except Exception as exc:
-                msg = str(exc) or exc.__class__.__name__
-                log.error("❌ %s login FAIL: %s", label, msg[:200])
-                if any(k in msg.lower() for k in ("api_id", "api_hash", "unauthorized", "token")):
-                    log.error("   → api_id/api_hash/token galat lag raha hai (ye account skip)")
-                elif any(k in msg.lower() for k in ("auth_key", "session", "revoked")):
-                    log.error("   → session problem: bot token dobara check karo / naya token lo")
-                elif any(k in msg.lower() for k in ("connect", "timeout", "network")):
-                    log.error("   → network issue: Render outbound blocked / DC reachable nahi")
-                JOB["last_error"] = f"{label}: {msg[:160]}"
-                continue          # baaki accounts chalte rahenge
-            accounts.append((label, acc_obj))
-        elif token:
+                await acc_obj.close()
+            except Exception:
+                pass
+            return None
+
+    if MODE == "user":
+        tasks = []
+        for idx, acc in enumerate(POOL, start=1):
+            label = f"acc{idx}"
+            tasks.append(asyncio.create_task(login_mtproto(idx, acc, label)))
+            if LOGIN_STAGGER > 0:
+                await asyncio.sleep(min(LOGIN_STAGGER, 0.15))   # sirf socket burst bachane ke liye
+        log.info("🔐 %s MTProto account parallel login ho rahe hain…", len(tasks))
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        accounts = [r for r in results if isinstance(r, tuple)]
+    else:
+        for idx, acc in enumerate(POOL, start=1):
+            label = f"acc{idx}"
+            token = acc["bot_token"]
+            if not token:
+                log.warning("%s skip — bot_token missing", label)
+                continue
             if http_client is None:
                 http_client = httpx.AsyncClient(
                     timeout=60.0,
@@ -1001,9 +1037,6 @@ async def run() -> None:
                     http2=False,
                 )
             accounts.append((label, BotAccount(token, channel, admin, label=label)))
-        else:
-            log.warning("%s skip — api_id/api_hash ya bot_token missing", label)
-
     if not accounts:
         JOB["last_error"] = "koi account login nahi ho paya (BOT_TOKEN/API_ID/API_HASH check karo)"
         log.error("❌ koi valid account nahi mila — Render env me BOT_TOKEN / API_ID+API_HASH check karo. "
@@ -1020,6 +1053,23 @@ async def run() -> None:
              ", ".join(pool.labels), len(pool), CONCURRENCY, pattern,
              "wait (order safe)" if WAIT_FOR_ACCOUNT else "agla free account")
 
+    # ---- SHARED CHAT throttle: sab accounts ek hi channel me bhejte hain ----
+    # Official: "single chat me 1 msg/sec se zyada nahi" — limit CHAT ki hai.
+    # Isliye 13 bots ka combined ceiling ~60 msg/min hai, 13x20 nahi.
+    chat_lock = asyncio.Lock()
+    chat_next = [0.0]
+
+    async def chat_gate():
+        if CHAT_PER_SEC <= 0:
+            return
+        gap = 1.0 / CHAT_PER_SEC
+        async with chat_lock:
+            now = time.monotonic()
+            if chat_next[0] > now:
+                await asyncio.sleep(chat_next[0] - now)
+                now = time.monotonic()
+            chat_next[0] = now + gap
+
     async def raw_send(label, text, file=None, caption=None):
         if DRY_RUN:
             # DRY_RUN me bhi realistic timing (0.35s/msg) taaki speed naap sako
@@ -1027,6 +1077,7 @@ async def run() -> None:
             return
         sender = pool.senders[label]
         gate = pool.gates[label]
+        await chat_gate()                     # channel-level 1 msg/sec (official rule)
         async with gate.lane:                 # ek account ke msg order me, par dusre accounts parallel
             if isinstance(sender, MtprotoAccount):
                 await sender.send_record(text, file)
